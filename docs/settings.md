@@ -108,6 +108,12 @@ animation, holding a live video signal, so a TV or GCVideo has time to lock on b
 animation starts. `postboot_delay_ms` holds the last frame after picking a game, before it
 boots.
 
+On **IPL 1.0 (NTSC)** the preboot wait shows a black picture, then the full animation plays
+from its first frame, so the delay is invisible. A HDMI adapter needs roughly 2.5 to 3
+seconds to lock video *and* audio, so try `preboot_delay_ms = 3000` and lower it until the
+start of the animation or the first sound is clipped. On the other IPL revisions the wait
+still runs before the picture is switched on.
+
 ## `text_scroll`
 
 A game title longer than the info box holds still, then scrolls sideways so the whole name
