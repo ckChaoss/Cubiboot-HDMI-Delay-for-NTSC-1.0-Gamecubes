@@ -57,6 +57,8 @@ __attribute_data__ static int fix_pal_ntsc = 0;
 
 // used for optional delays
 __attribute_data__ u32 preboot_delay_ms = 0;
+// Set by the loader on IPL revisions that have the black-frame hold (pre_unblank_delay).
+__attribute_data__ u32 preboot_black_hold = 0;
 __attribute_data__ u32 postboot_delay_ms = 0;
 __attribute_data__ u64 completed_time = 0;
 
@@ -388,13 +390,97 @@ __attribute_used__ void pre_menu_init(int unk) {
     mod_cube_anim();
 
     // Delay before the boot animation, so a TV / GCVideo has time to lock onto the signal.
-    // Waiting on retrace rather than the time base keeps VI running through the wait, which
-    // is the whole point -- there has to be a signal present to lock onto.
-    const u32 fields_per_sec = rmode->viTVMode >> 2 == VI_NTSC ? 60 : 50;
-    const u32 total_frames = ((u64)preboot_delay_ms * fields_per_sec) / 1000;
-    for (u32 i = 0; i < total_frames; i++) {
-        VIWaitForRetrace();
+    // This wait runs while the IPL still has the picture blanked (no active video), so an
+    // HDMI adapter cannot lock during it. Revisions with the black-frame hold below do their
+    // waiting there instead, once the picture is on.
+    if (!preboot_black_hold) {
+        const u32 fields_per_sec = rmode->viTVMode >> 2 == VI_NTSC ? 60 : 50;
+        const u32 total_frames = ((u64)preboot_delay_ms * fields_per_sec) / 1000;
+        for (u32 i = 0; i < total_frames; i++) {
+            VIWaitForRetrace();
+        }
     }
+}
+
+/*
+ * Preboot delay, black-frame hold (NTSC 1.0 hook at 0x813019bc).
+ *
+ * BS2's frame-swap routine (0x8130191c, run once per frame) un-blanks the picture exactly
+ * once, on the first frame, right after queuing frame 0 of the cube animation:
+ *
+ *     813019a0: lwz r3, cur_xfb
+ *     813019ac: bl VISetNextFrameBuffer
+ *     813019bc: li r3, 0
+ *     813019c0: bl VISetBlack          ; VISetBlack(FALSE) -> picture appears
+ *
+ * While the VI is blanked it sends sync only (zero active lines), so an HDMI adapter or
+ * capture card sees "no signal" and cannot lock. We patch the `li r3, 0` into
+ * `bl pre_unblank_delay`, which returns 0 in r3 so the stock `bl VISetBlack` still gets
+ * its FALSE argument.
+ *
+ * In the hook we paint the spare XFB black, point the VI at it, turn the picture on and
+ * wait. The adapter locks onto a real (black) picture while the animation, which only
+ * advances when we return, stays untouched. Then frame 0 is restored and BS2 carries on,
+ * so what is seen is: black -> full animation from its first frame, with the audio cues
+ * (frame counted) landing after the link is up.
+ *
+ * Runs once only (the IPL clears its first-frame flag right after). Uses VIWaitForRetrace
+ * (the same call BS2 makes a few instructions later, so it is safe in this context), but
+ * bounds the wait by the time base so it is correct for 50/60 Hz and 480p alike.
+ */
+__attribute_used__ u32 pre_unblank_delay(void) {
+    if (preboot_delay_ms) {
+        // NTSC 1.0 addresses in BS2 (only reached through the NTSC 1.0 hook).
+        void (*bs2_VISetNextFrameBuffer)(void *) = (void (*)(void *))0x8133ee1c;
+        void (*bs2_VISetBlack)(u32)              = (void (*)(u32))0x8133ee88;
+        void (*bs2_VIFlush)(void)                = (void (*)(void))0x8133ed18;
+
+        // BS2 small-data variables (r13 = 0x81465320): the two XFBs, the one that holds
+        // the frame we are about to show, and the video mode they were sized from.
+        void **xfb_a_ptr = (void **)0x8145d590;   // r13-32144
+        void **xfb_b_ptr = (void **)0x8145d594;   // r13-32140
+        void **cur_ptr   = (void **)0x8145d598;   // r13-32136
+        u8   **mode_ptr  = (u8 **)0x8145d59c;     // r13-32132 (GXRModeObj*)
+
+        void *cur   = *cur_ptr;                   // frame 0 of the cube animation
+        void *other = (cur == *xfb_a_ptr) ? *xfb_b_ptr : *xfb_a_ptr;
+
+        // Same size BS2 allocated each XFB with: ((fbWidth + 15) & ~15) * xfbHeight * 2.
+        u32 fb_width   = *(u16 *)(*mode_ptr + 4);
+        u32 xfb_height = *(u16 *)(*mode_ptr + 8);
+        u32 bytes      = ((fb_width + 15) & ~15u) * xfb_height * 2;
+
+        // Paint the spare XFB black (YUY2 black = Y 0x10, Cb/Cr 0x80, which is exactly what
+        // the animation's own black background converts to) and push it out of the cache
+        // so the VI DMA sees it. The loop has an asm statement in it so GCC cannot turn it
+        // into a memset() call (there is no libc here).
+        for (u32 off = 0; off + 32 <= bytes; off += 32) {
+            u32 *line = (u32 *)((u8 *)other + off);
+            line[0] = 0x10801080; line[1] = 0x10801080;
+            line[2] = 0x10801080; line[3] = 0x10801080;
+            line[4] = 0x10801080; line[5] = 0x10801080;
+            line[6] = 0x10801080; line[7] = 0x10801080;
+            __asm__ volatile("dcbf 0,%0" : : "r"(line) : "memory");
+        }
+        __asm__ volatile("sync" : : : "memory");
+
+        // Switch the picture ON, but showing the black buffer. The adapter / capture card
+        // now sees a real active-video signal (it ignores the blanked one) and can lock
+        // while nothing visible happens. The animation has not advanced: it only moves
+        // when we return.
+        bs2_VISetNextFrameBuffer(other);
+        bs2_VISetBlack(0);
+        bs2_VIFlush();
+
+        u64 start = gettime();
+        while (diff_msec(start, gettime()) < preboot_delay_ms) {
+            VIWaitForRetrace();
+        }
+
+        // Hand frame 0 back; BS2's own VIFlush right after this hook displays it.
+        bs2_VISetNextFrameBuffer(cur);
+    }
+    return 0;
 }
 
 __attribute_used__ void pre_main() {
