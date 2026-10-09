@@ -322,6 +322,7 @@ int main(int argc, char **argv) {
     set_patch_value(symshdr, syment, symstringdata, "show_watermark", settings.show_watermark);
 
     set_patch_value(symshdr, syment, symstringdata, "preboot_delay_ms", settings.preboot_delay_ms);
+	set_patch_value(symshdr, syment, symstringdata, "preboot_black_hold", current_bios->version == IPL_NTSC_10);
     set_patch_value(symshdr, syment, symstringdata, "postboot_delay_ms", settings.postboot_delay_ms);
 
     set_patch_value(symshdr, syment, symstringdata, "text_scroll_enabled", settings.text_scroll_enabled);
