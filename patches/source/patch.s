@@ -124,6 +124,10 @@ patch_inst_pal  "_replace_report" 0x8135d924 0x8135a264 0x81300520 b custom_OSRe
 patch_inst_ntsc "_patch_menu_init" 0x8130128c 0x81301094 0x81301448 0x8130144c bl pre_menu_init
 patch_inst_pal "_patch_menu_init" 0x81301094 0x81301094 0x81301200 bl pre_menu_init
 
+
+// NTSC 1.0 only: preboot_delay_ms hold, with a black picture on (see pre_unblank_delay).
+patch_inst vNTSC_10(_unblank_delay) 0x813019bc bl pre_unblank_delay
+
 patch_inst_ntsc "_patch_menu_alpha_setup" 0x81312108 0x81312358 0x813126f0 0x81312708 bl pre_menu_alpha_setup
 patch_inst_pal "_patch_menu_alpha_setup" 0x81312c3c 0x81312284 0x81312d7c bl pre_menu_alpha_setup
 
