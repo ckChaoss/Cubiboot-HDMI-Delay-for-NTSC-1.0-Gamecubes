@@ -371,6 +371,18 @@ the device and audio teardown. The IPL's frame loop has already exited by then, 
 frame it drew stays on screen for the whole wait — the effect the option exists to produce.
 `bs2tick()` therefore no longer returns `STATE_WAIT_LOAD` on any path.
 
+**`preboot_delay_ms` on IPL 1.0 (NTSC): hold on a black picture, not a blanked one.** The wait
+in `pre_menu_init()` runs while BS2 still has the VI in black mode (`VISetBlack(TRUE)`), which
+outputs sync with zero active lines. An HDMI adapter or capture card treats that as no signal,
+so it could not start locking until the wait was over and the animation was already running.
+`pre_unblank_delay()` (hooked at `0x813019bc`, the one-shot `VISetBlack(FALSE)` in BS2's
+frame-swap routine) now does the waiting instead: it paints the spare XFB black, switches the
+picture on showing it, waits `preboot_delay_ms`, then hands frame 0 back. The adapter locks on
+a real picture while nothing visible happens, and the animation has not advanced, so it plays
+in full with its audio cues. The loader sets `preboot_black_hold` on IPL 1.0 so the old wait
+in `pre_menu_init()` is skipped there; other revisions keep it. The addresses are NTSC 1.0
+only; other revisions need their own entries in `patch.s` before they can use the hold.
+
 ## N. Faster game lists  (`cubeboot/source/emu/ffs/`)
 
 Two changes under FatFs, both aimed at the same thing: a folder of games took long enough
