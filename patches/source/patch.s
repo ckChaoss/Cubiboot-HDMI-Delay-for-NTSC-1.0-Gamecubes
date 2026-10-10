@@ -128,6 +128,11 @@ patch_inst_pal "_patch_menu_init" 0x81301094 0x81301094 0x81301200 bl pre_menu_i
 // NTSC 1.0 only: preboot_delay_ms hold, with a black picture on (see pre_unblank_delay).
 patch_inst vNTSC_10(_unblank_delay) 0x813019bc bl pre_unblank_delay
 
+// NTSC 1.0 only: force_progressive. BS2 1.0 resets the VI hardware with a hard-coded
+// __VIInit(VI_TVMODE_NTSC_INT) before main and never switches the VI clock afterwards, so
+// the menu's 480p mode (pre_main) needs the hardware started in 480p too (see pre_vi_init_mode).
+patch_inst vNTSC_10(_vi_init_mode) 0x81300710 bl pre_vi_init_mode
+
 patch_inst_ntsc "_patch_menu_alpha_setup" 0x81312108 0x81312358 0x813126f0 0x81312708 bl pre_menu_alpha_setup
 patch_inst_pal "_patch_menu_alpha_setup" 0x81312c3c 0x81312284 0x81312d7c bl pre_menu_alpha_setup
 
