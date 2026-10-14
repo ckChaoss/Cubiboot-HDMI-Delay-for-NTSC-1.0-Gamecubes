@@ -99,6 +99,52 @@ __attribute_aligned_data_lowmem__ static gm_file_entry_t gm_swiss_pin_entry;
 static bool gm_swiss_pin_ready = false;
 
 #define GM_SWISS_PIN_PATH "/swiss-gc.dol"
+// Optional banner art for the tile: a normal opening.bnr (the same format apps use, made with
+// tools/banner-converter), renamed and dropped next to swiss-gc.dol at the card root. .bnr is
+// not a listed extension, so it never shows up in the grid itself.
+#define GM_SWISS_PIN_BNR_PATH "/swiss-gc.bnr"
+
+// The tile's own banner storage, separate from gm_banner_pool: gm_start_thread wipes that
+// pool on every folder change, and the pinned tile has to survive those. Lowmem, so it adds
+// nothing to the loader image (see gm_swiss_pin_entry above).
+__attribute_aligned_data_lowmem__ static BNR gm_swiss_pin_bnr;
+__attribute_aligned_data_lowmem__ static gm_banner_buf_t gm_swiss_pin_banner_buf;
+
+// Reads /swiss-gc.bnr into the tile's own buffers. Runs once, on the enum thread, which is
+// where the card can safely be read (see the cold-boot note further down). Returns false when
+// there is no usable file, and the tile then keeps the plain DOL icon.
+static bool gm_swiss_pin_load_banner(void) {
+    if (dvd_custom_open(GM_SWISS_PIN_BNR_PATH, FILE_ENTRY_TYPE_FILE, IPC_FILE_FLAG_DISABLECACHE) != 0)
+        return false;
+    file_status_t *status = dvd_custom_status();
+    if (status == NULL || status->result != 0)
+        return false;
+
+    // BNR1 (one language) is shorter than the BNR2-shaped struct; clamp and clear first, the
+    // same way app banners are read. Anything shorter than the pixel data is not a banner.
+    u32 fsize = (u32)__builtin_bswap64(*(u64*)&status->fsize);
+    u32 min_len = (u32)((u8*)&gm_swiss_pin_bnr.desc[1] - (u8*)&gm_swiss_pin_bnr);
+    if (fsize < min_len) {
+        OSReport("ERROR: %s is too small to be a banner (%u bytes)\n", GM_SWISS_PIN_BNR_PATH, fsize);
+        dvd_custom_close(status->fd);
+        return false;
+    }
+    u32 read_len = sizeof(BNR);
+    if (fsize < read_len) read_len = fsize;
+
+    memset(&gm_swiss_pin_bnr, 0, sizeof(BNR));
+    int r = dvd_read(&gm_swiss_pin_bnr, read_len, 0, status->fd);
+    dvd_custom_close(status->fd);
+    if (r != 0 || gm_swiss_pin_bnr.magic[0] != 'B' || gm_swiss_pin_bnr.magic[1] != 'N' || gm_swiss_pin_bnr.magic[2] != 'R') {
+        OSReport("ERROR: could not read %s\n", GM_SWISS_PIN_BNR_PATH);
+        return false;
+    }
+
+    memcpy(&gm_swiss_pin_banner_buf.data[0], &gm_swiss_pin_bnr.pixelData[0], BNR_PIXELDATA_LEN);
+    gm_swiss_pin_banner_buf.used = 1;
+    DCFlushRange(&gm_swiss_pin_banner_buf, sizeof(gm_swiss_pin_banner_buf));
+    return true;
+}
 
 static void gm_swiss_pin_setup(void) {
     if (gm_swiss_pin_ready) return;
@@ -112,6 +158,20 @@ static void gm_swiss_pin_setup(void) {
     strcpy(gm_swiss_pin_entry.desc.fullGameName, "Swiss");
     strcpy(gm_swiss_pin_entry.desc.description, "Open Swiss (swiss-gc.dol)");
     gm_swiss_pin_entry.second = NULL;
+
+    if (gm_swiss_pin_load_banner()) {
+        // Drawn and described like an app: the banner on the cube and in the info box, and
+        // the banner's own name and description. It still boots as /swiss-gc.dol -- an app
+        // entry boots its path the same way a plain .dol does (main.c).
+        gm_swiss_pin_entry.type = GM_FILE_TYPE_APP;
+        gm_swiss_pin_entry.extra.standalone_bnr = true;
+        gm_swiss_pin_entry.asset.use_banner = true;
+        gm_swiss_pin_entry.asset.banner.buf = &gm_swiss_pin_banner_buf;
+        gm_swiss_pin_entry.asset.banner.state = GM_LOAD_STATE_LOADED;
+        memcpy(&gm_swiss_pin_entry.desc, &gm_swiss_pin_bnr.desc[0], sizeof(BNRDesc));
+        if (gm_swiss_pin_entry.desc.fullGameName[0] == '\0')
+            strcpy(gm_swiss_pin_entry.desc.fullGameName, "Swiss");
+    }
 
     DCFlushRange(&gm_swiss_pin_entry, sizeof(gm_swiss_pin_entry));
     gm_swiss_pin_ready = true;
