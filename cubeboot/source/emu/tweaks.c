@@ -31,6 +31,12 @@ void emu_update_boot() {
     dvd_custom_close(status->fd);
 }
 
+// Whether the Swiss that games are launched with is there (card root, or a FlippyDrive's
+// flash). The pinned Swiss tile only shows when it is.
+bool emu_found_swiss() {
+    return found_swiss;
+}
+
 bool emu_can_boot(gm_file_entry_t *entry) {
     switch (entry->type) {
         case GM_FILE_TYPE_GAME:
