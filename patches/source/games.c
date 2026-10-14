@@ -35,6 +35,12 @@
 
 #define PRELOAD_LINE_COUNT 2
 #define ASSET_BUFFER_COUNT 128
+// The last banner-pool slot is kept for the pinned Swiss tile's banner (swiss-gc.bnr), so
+// folders get the rest. Reserving a slot that already exists, rather than adding a buffer,
+// is deliberate: growing .data_lowmem by ~14KB for that banner broke the boot animation on
+// an NTSC 1.0 console (purple/green garbage, then a hang). Net memory change: none.
+#define GM_BANNER_POOL_GAMES (ASSET_BUFFER_COUNT - 1)
+#define GM_BANNER_PIN_SLOT   (ASSET_BUFFER_COUNT - 1)
 
 // Swiss maintains a recent-games list at this path (when its "Recent List" option is
 // enabled). cubeboot boots games by chainloading swiss-gc.dol with Autoload=, so every
@@ -100,6 +106,13 @@ static bool gm_swiss_pin_ready = false;
 
 #define GM_SWISS_PIN_PATH "/swiss-gc.dol"
 
+// Optional banner art for the tile: a normal opening.bnr (tools/banner-converter), renamed
+// and put at the card root next to swiss-gc.dol. .bnr is not a listed extension, so it never
+// shows in the grid itself.
+#define GM_SWISS_PIN_BNR_PATH "/swiss-gc.bnr"
+
+static int gm_load_banner(gm_file_entry_t *entry, u32 aram_offset, bool force_unload, bool use_cache);
+
 static void gm_swiss_pin_setup(void) {
     if (gm_swiss_pin_ready) return;
 
@@ -112,6 +125,29 @@ static void gm_swiss_pin_setup(void) {
     strcpy(gm_swiss_pin_entry.desc.fullGameName, "Swiss");
     strcpy(gm_swiss_pin_entry.desc.description, "Open Swiss (swiss-gc.dol)");
     gm_swiss_pin_entry.second = NULL;
+
+    // Try the banner through the same loader app banners use (its existing read buffer, no
+    // new memory), stored in the reserved pool slot. Shaped as an app for the load -- that
+    // is what makes the loader treat the file as a standalone opening.bnr and keep its own
+    // title -- and it still boots as /swiss-gc.dol, as app entries boot their path.
+    gm_swiss_pin_entry.type = GM_FILE_TYPE_APP;
+    gm_swiss_pin_entry.extra.standalone_bnr = true;
+    gm_swiss_pin_entry.extra.dvd_bnr_offset = 0;
+    gm_swiss_pin_entry.asset.use_banner = true;
+    if (!gm_load_banner(&gm_swiss_pin_entry, 0, false, false)) {
+        // No file, or not a banner: back to the plain DOL icon.
+        gm_swiss_pin_entry.type = GM_FILE_TYPE_PROGRAM;
+        gm_swiss_pin_entry.extra.standalone_bnr = false;
+        gm_swiss_pin_entry.asset.use_banner = false;
+        gm_swiss_pin_entry.asset.banner.buf = NULL;
+        gm_swiss_pin_entry.asset.banner.state = GM_LOAD_STATE_NONE;
+        // The reserved slot is only claimed once the file has been read, so a failed load
+        // leaves it untouched (gm_init_heap zeroed it at startup).
+        strcpy(gm_swiss_pin_entry.desc.fullGameName, "Swiss");
+        strcpy(gm_swiss_pin_entry.desc.description, "Open Swiss (swiss-gc.dol)");
+    } else if (gm_swiss_pin_entry.desc.fullGameName[0] == '\0') {
+        strcpy(gm_swiss_pin_entry.desc.fullGameName, "Swiss");
+    }
 
     DCFlushRange(&gm_swiss_pin_entry, sizeof(gm_swiss_pin_entry));
     gm_swiss_pin_ready = true;
@@ -160,7 +196,7 @@ static int gm_count_icon_buf() {
 }
 
 static inline gm_banner_buf_t *gm_get_banner_buf() {
-    for (int i = 0; i < ASSET_BUFFER_COUNT; i++) {
+    for (int i = 0; i < GM_BANNER_POOL_GAMES; i++) {
         if (gm_banner_pool[i].used == 0) {
             gm_banner_pool[i].used = 1;
             return &gm_banner_pool[i];
@@ -177,7 +213,7 @@ static inline void gm_free_banner_buf(gm_banner_buf_t *buf) {
 
 static int gm_count_banner_buf() {
     int count = 0;
-    for (int i = 0; i < ASSET_BUFFER_COUNT; i++) {
+    for (int i = 0; i < GM_BANNER_POOL_GAMES; i++) {
         if (gm_banner_pool[i].used == 1) count++;
     }
 
@@ -729,7 +765,9 @@ static int gm_load_banner(gm_file_entry_t *entry, u32 aram_offset, bool force_un
     // load the banner
     char bnr_path_buf[GM_PATH_MAX];
     const char *bnr_path = entry->path;
-    if (entry->extra.standalone_bnr) {
+    if (entry == &gm_swiss_pin_entry) {
+        bnr_path = GM_SWISS_PIN_BNR_PATH; // not <dir>/opening.bnr like an app
+    } else if (entry->extra.standalone_bnr) {
         gm_app_banner_path(entry->path, bnr_path_buf);
         bnr_path = bnr_path_buf;
     }
@@ -765,7 +803,13 @@ static int gm_load_banner(gm_file_entry_t *entry, u32 aram_offset, bool force_un
     cached:
 
     entry->asset.banner.state = GM_LOAD_STATE_LOADING;
-    gm_banner_buf_t *banner_ptr = gm_get_banner_buf();
+    gm_banner_buf_t *banner_ptr;
+    if (entry == &gm_swiss_pin_entry) {
+        banner_ptr = &gm_banner_pool[GM_BANNER_PIN_SLOT]; // reserved, never handed to a folder
+        banner_ptr->used = 1;
+    } else {
+        banner_ptr = gm_get_banner_buf();
+    }
     if (banner_ptr == NULL) {
         OSReport("ERROR: could not allocate memory\n");
         return false;
@@ -916,7 +960,7 @@ void gm_check_files(int path_count) {
             // has more than ASSET_BUFFER_COUNT games) switch to the sliding window: leave
             // the rest unloaded and let gm_line_load read them from disc on scroll.
             // <=128 games => all resident (the proven, cold-boot-safe path, unchanged).
-            if (!gm_evict_on_scroll && gm_count_banner_buf() >= ASSET_BUFFER_COUNT) {
+            if (!gm_evict_on_scroll && gm_count_banner_buf() >= GM_BANNER_POOL_GAMES) {
                 gm_evict_on_scroll = true;
             }
             // Last-played scan: defer ALL banner loading to the background loader
@@ -961,7 +1005,7 @@ void gm_check_files(int path_count) {
             backing->extra.standalone_bnr = true;
 
             // Same pool rules as games: resident while there is room, sliding window after.
-            if (!gm_evict_on_scroll && gm_count_banner_buf() >= ASSET_BUFFER_COUNT) {
+            if (!gm_evict_on_scroll && gm_count_banner_buf() >= GM_BANNER_POOL_GAMES) {
                 gm_evict_on_scroll = true;
             }
             if (!gm_evict_on_scroll && !gm_scan_is_last_played) {
@@ -1327,7 +1371,7 @@ static void gm_bg_load_last_played(int target_slot) {
         int type = gm_entry_backing[i]->type;
         if (type == GM_FILE_TYPE_GAME || type == GM_FILE_TYPE_APP) game_count++;
     }
-    bool resident = (game_count <= ASSET_BUFFER_COUNT);
+    bool resident = (game_count <= GM_BANNER_POOL_GAMES);
     // >pool: must use the sliding window (banners load/free on scroll). <=pool: stay resident
     // so scrolling never re-reads once filled.
     gm_evict_on_scroll = !resident;
@@ -1634,7 +1678,9 @@ void gm_start_thread(const char *target) {
     // Every entry is gone, so nothing can own a pool slot now: reset the pools outright
     // rather than trust the per-entry frees. A slot that slipped through (a schedule_free
     // nobody services, a free path missing a type) would otherwise be lost for the session.
-    memset(gm_banner_pool, 0, sizeof(gm_banner_pool));
+    // Only the folder's slots: the reserved last one holds the pinned Swiss banner, which
+    // outlives every folder change.
+    memset(gm_banner_pool, 0, sizeof(gm_banner_buf_t) * GM_BANNER_POOL_GAMES);
     memset(gm_icon_pool, 0, sizeof(gm_icon_pool));
 
     number_of_lines = 0;
