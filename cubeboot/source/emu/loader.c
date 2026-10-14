@@ -111,7 +111,11 @@ void chainload_swiss_game(char* game_path, bool passthrough) {
 
     // dirty hack
     if (is_swiss(game_path)) {
-        info = load_dol_file(game_path, false);
+        // The root copy is the one games are launched with, so open it the same way the
+        // chainload below does: flash first. On a FlippyDrive that is where Swiss lives and
+        // the card root is only a fallback, so the pinned Swiss tile (which always points
+        // at /swiss-gc.dol) would otherwise fail on a card that carries no copy.
+        info = load_dol_file(game_path, strcmp(game_path, "/swiss-gc.dol") == 0);
         run(info.entrypoint);
     }
 
