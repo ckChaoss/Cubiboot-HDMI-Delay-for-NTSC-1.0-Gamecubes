@@ -1093,65 +1093,203 @@ static void gm_icon_ci8_to_rgb5a3(const u8 *ci8, const u8 *palette, u8 *out) {
     }
 }
 
-// Frame 0 of this game's save icon into the icon pool. Quietly does nothing when the game
-// has no save, the save has no icon, or the pool is full -- the cube keeps its banner.
-static void gm_load_save_icon(gm_file_entry_t *entry) {
-    if (gm_cards == NULL || gm_icon_scratch == NULL) return;
+// Where each frame of a save's icon sits, read the way Dolphin's GCMemcard does: the
+// animation is the frames up to the first with a speed of 0, frames follow the banner (if
+// any) in order, and a shared CI8 palette follows the last frame.
+typedef struct {
+    int count;            // frames in the animation (1..8)
+    u8  fmt[8];
+    u8  speed[8];         // 1/2/3 = 4/8/12 ticks of 1/60 s
+    u32 offset[8];        // into the save's data
+    u32 shared_palette;   // into the save's data
+    bool bounce;          // ping-pong instead of loop
+} gm_icon_layout_t;
 
-    gm_card_t *card = &gm_cards[gm_card_region(entry->extra.game_id)];
-    if (!gm_card_open(card, gm_card_region(entry->extra.game_id))) return;
+static bool gm_icon_layout(const gm_card_dirent_t *de, gm_icon_layout_t *lo) {
+    if (de->icon_addr == 0xFFFFFFFF) return false;
+    if ((de->icon_fmt & 3) == GM_ICON_NONE) return false; // Dolphin/BIOS: no icon at all
 
-    const gm_card_dirent_t *de = NULL;
+    u32 pos = de->icon_addr;
+    switch (de->banner_fmt & 3) {
+        case 1: pos += 96 * 32 + 0x200; break; // CI8 banner + palette
+        case 2: pos += 96 * 32 * 2; break;     // RGB5A3 banner
+    }
+
+    lo->count = 0;
+    for (int f = 0; f < 8; f++) {
+        u8 speed = (de->icon_speed >> (2 * f)) & 3;
+        if (speed == 0) break;
+        lo->fmt[f] = (de->icon_fmt >> (2 * f)) & 3;
+        lo->speed[f] = speed;
+        lo->offset[f] = pos;
+        pos += gm_icon_frame_size(lo->fmt[f]);
+        lo->count++;
+    }
+    lo->shared_palette = pos;
+    lo->bounce = (de->banner_fmt & 0x04) != 0; // CARD_ANIM_BOUNCE
+    return lo->count > 0;
+}
+
+// Reads frame `f` (which must have a pixel format) as 32x32 RGB5A3 into `out`.
+static bool gm_read_icon_frame(gm_card_t *card, const gm_card_dirent_t *de, const gm_icon_layout_t *lo, int f, u8 *out) {
+    u8 *raw = gm_icon_scratch;
+    switch (lo->fmt[f]) {
+        case GM_ICON_RGB5A3:
+            return gm_card_read_file(card, de, lo->offset[f], 0x800, out);
+        case GM_ICON_CI8:
+        case GM_ICON_CI8_SHARE: {
+            u32 pal_at = lo->fmt[f] == GM_ICON_CI8 ? lo->offset[f] + 0x400 : lo->shared_palette;
+            if (!gm_card_read_file(card, de, lo->offset[f], 0x400, raw)) return false;
+            if (!gm_card_read_file(card, de, pal_at, 0x200, raw + 0x400)) return false;
+            gm_icon_ci8_to_rgb5a3(raw, raw + 0x400, out);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+static const gm_card_dirent_t *gm_find_save(gm_card_t *card, const u8 *game_id) {
     for (int i = 0; i < GM_CARD_DIR_COUNT; i++) {
         const gm_card_dirent_t *d = (const gm_card_dirent_t *)&card->dir[i * sizeof(gm_card_dirent_t)];
         if (d->gamecode[0] == 0xFF) continue; // empty slot
-        if (memcmp(d->gamecode, entry->extra.game_id, 4) != 0) continue;
-        if (memcmp(d->company, &entry->extra.game_id[4], 2) != 0) continue;
+        if (memcmp(d->gamecode, game_id, 4) != 0) continue;
+        if (memcmp(d->company, &game_id[4], 2) != 0) continue;
         if (d->icon_addr == 0xFFFFFFFF || (d->icon_fmt & 3) == GM_ICON_NONE) continue;
-        de = d;
-        break;
+        return d;
     }
+    return NULL;
+}
+
+// Animation details live in the first frame's pool slot, in its spare header words, so
+// animating needs no memory of its own. A still icon has count 1.
+typedef struct {
+    u8  slot[8];   // icon pool index shown for each frame
+    u8  ticks[8];  // how long each frame stays up, in 1/60 s
+    u16 cycle;     // ticks in one full cycle (0 = still)
+    u8  bounce;
+    u8  count;     // written last: the draw code treats count <= 1 as a still
+} gm_icon_anim_t;
+_Static_assert(sizeof(gm_icon_anim_t) <= sizeof(((gm_icon_buf_t *)0)->padding), "fits the slot header");
+#define GM_ICON_ANIM(buf) ((gm_icon_anim_t *)(void *)(buf)->padding)
+
+static inline int gm_icon_slot_index(const gm_icon_buf_t *buf) {
+    return (int)(buf - gm_icon_pool);
+}
+
+// The frame to draw for this icon at `tick` (a 60 Hz counter kept by the menu).
+const u8 *gm_icon_frame_data(gm_icon_buf_t *first, u32 tick) {
+    const gm_icon_anim_t *a = GM_ICON_ANIM(first);
+    if (a->count <= 1 || a->cycle == 0) return first->data;
+
+    int n = a->count;
+    int steps = a->bounce ? (2 * n - 2) : n; // bounce: 0..n-1 then n-2..1
+    u32 t = tick % a->cycle;
+    for (int s = 0; s < steps; s++) {
+        int f = s < n ? s : (2 * n - 2 - s);
+        if (t < a->ticks[f]) return gm_icon_pool[a->slot[f]].data;
+        t -= a->ticks[f];
+    }
+    return first->data;
+}
+
+// Pass 1: frame 0 of this game's save icon into the icon pool, as a still. Quietly does
+// nothing when the game has no save, the save has no icon, or the pool is full -- the cube
+// keeps its banner. Every saved game gets its still before any animation frames are loaded
+// (pass 2), so a full pool costs animation, never icons.
+static void gm_load_save_icon(gm_file_entry_t *entry) {
+    if (gm_cards == NULL || gm_icon_scratch == NULL) return;
+
+    int region = gm_card_region(entry->extra.game_id);
+    gm_card_t *card = &gm_cards[region];
+    if (!gm_card_open(card, region)) return;
+
+    const gm_card_dirent_t *de = gm_find_save(card, entry->extra.game_id);
     if (de == NULL) return;
 
-    // Skip the banner, if the save has one, to reach the icon frames.
-    u32 pos = de->icon_addr;
-    switch (de->banner_fmt & 3) {
-        case 1: pos += 96 * 32 + 0x200; break; // CI8 + palette
-        case 2: pos += 96 * 32 * 2; break;     // RGB5A3
-    }
-
-    // The animation is the frames up to the first one with a speed of 0, and a shared
-    // palette follows the last of those (same reading as Dolphin's GCMemcard).
-    int fmt0 = de->icon_fmt & 3;
-    if ((de->icon_speed & 3) == 0) return; // no frames at all
-    u32 shared_palette = pos;
-    for (int f = 0; f < 8; f++) {
-        if (((de->icon_speed >> (2 * f)) & 3) == 0) break;
-        shared_palette += gm_icon_frame_size((de->icon_fmt >> (2 * f)) & 3);
-    }
+    gm_icon_layout_t lo;
+    if (!gm_icon_layout(de, &lo)) return;
 
     gm_icon_buf_t *slot = gm_get_icon_buf();
     if (slot == NULL) return; // pool full: this one keeps its banner
 
-    u8 *raw = gm_icon_scratch;
-    bool ok;
-    if (fmt0 == GM_ICON_RGB5A3) {
-        ok = gm_card_read_file(card, de, pos, 0x800, slot->data);
-    } else {
-        u32 pal_at = (fmt0 == GM_ICON_CI8) ? pos + 0x400 : shared_palette;
-        ok = gm_card_read_file(card, de, pos, 0x400, raw) &&
-             gm_card_read_file(card, de, pal_at, 0x200, raw + 0x400);
-        if (ok) gm_icon_ci8_to_rgb5a3(raw, raw + 0x400, slot->data);
-    }
-
-    if (!ok) {
+    if (!gm_read_icon_frame(card, de, &lo, 0, slot->data)) {
         gm_free_icon_buf(slot);
         return;
     }
-
     DCFlushRange(slot->data, ICON_PIXELDATA_LEN);
+
+    gm_icon_anim_t *a = GM_ICON_ANIM(slot);
+    memset(a, 0, sizeof(*a));
+    a->slot[0] = (u8)gm_icon_slot_index(slot);
+    a->count = 1;
+
     entry->asset.icon.buf = slot;
     entry->asset.icon.state = GM_LOAD_STATE_LOADED;
+}
+
+// Pass 2: the rest of this game's frames, if it animates and the pool has room for all of
+// them. All-or-nothing: if the pool runs out partway, the frames taken so far are given
+// back and the icon stays a still, rather than playing a broken animation.
+static void gm_load_save_icon_anim(gm_file_entry_t *entry) {
+    if (gm_cards == NULL || gm_icon_scratch == NULL) return;
+    if (entry->asset.icon.state != GM_LOAD_STATE_LOADED || entry->asset.icon.buf == NULL) return;
+
+    int region = gm_card_region(entry->extra.game_id);
+    gm_card_t *card = &gm_cards[region];
+    if (!card->ok) return;
+
+    const gm_card_dirent_t *de = gm_find_save(card, entry->extra.game_id);
+    if (de == NULL) return;
+
+    gm_icon_layout_t lo;
+    if (!gm_icon_layout(de, &lo) || lo.count <= 1) return;
+
+    gm_icon_buf_t *first = entry->asset.icon.buf;
+    gm_icon_buf_t *taken[8] = { 0 };
+    u8 slots[8];
+    slots[0] = (u8)gm_icon_slot_index(first);
+
+    // Frames that carry pixels get a slot each.
+    for (int f = 1; f < lo.count; f++) {
+        if (lo.fmt[f] == GM_ICON_NONE) continue;
+        gm_icon_buf_t *slot = gm_get_icon_buf();
+        if (slot == NULL || !gm_read_icon_frame(card, de, &lo, f, slot->data)) {
+            if (slot != NULL) gm_free_icon_buf(slot);
+            for (int k = 1; k < f; k++) if (taken[k]) gm_free_icon_buf(taken[k]);
+            return;
+        }
+        DCFlushRange(slot->data, ICON_PIXELDATA_LEN);
+        taken[f] = slot;
+        slots[f] = (u8)gm_icon_slot_index(slot);
+    }
+
+    // A frame without a format shows the next frame that has one, as the BIOS does
+    // (Luigi's Mansion and Pikmin rely on this); with none after it, the previous one.
+    for (int f = lo.count - 1; f >= 1; f--) {
+        if (lo.fmt[f] != GM_ICON_NONE) continue;
+        int next = -1;
+        for (int j = f + 1; j < lo.count; j++) {
+            if (lo.fmt[j] != GM_ICON_NONE) { next = j; break; }
+        }
+        slots[f] = next >= 0 ? slots[next] : slots[f - 1];
+    }
+
+    gm_icon_anim_t *a = GM_ICON_ANIM(first);
+    u32 cycle = 0;
+    int n = lo.count;
+    int steps = lo.bounce ? (2 * n - 2) : n;
+    for (int f = 0; f < n; f++) {
+        a->slot[f] = slots[f];
+        a->ticks[f] = (u8)(lo.speed[f] * 4); // 1/2/3 -> 4/8/12 ticks
+    }
+    for (int s = 0; s < steps; s++) {
+        int f = s < n ? s : (2 * n - 2 - s);
+        cycle += a->ticks[f];
+    }
+    a->bounce = lo.bounce;
+    a->cycle = (u16)cycle;
+    a->count = (u8)n; // last: until now the draw code saw a still
 }
 
 static void gm_save_icons_begin(void) {
@@ -1342,6 +1480,20 @@ void gm_check_files(int path_count) {
 
         // udelay_threaded(100 * 1000); // test only
         game_backing_count = gm_entry_count;
+    }
+
+    // Second pass: animation frames for the icons that animate, top of the folder first,
+    // into whatever room the icon pool has left after every still is in.
+    for (int i = 0; i < gm_entry_count && !gm_scan_stopped; i++) {
+        if (!OSTryLockMutex(game_enum_mutex)) {
+            gm_scan_stopped = true;
+            break;
+        }
+        OSUnlockMutex(game_enum_mutex);
+
+        gm_file_entry_t *entry = gm_entry_backing[i];
+        if (entry->type == GM_FILE_TYPE_GAME)
+            gm_load_save_icon_anim(entry);
     }
 
     gm_save_icons_end();
