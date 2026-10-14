@@ -767,6 +767,62 @@ __attribute_used__ void update_icon_positions() {
     anim_step += 0x7; // why is this the const?
 }
 
+// ---------------------------------------------------------------------------------------
+// Pinned Swiss tile (config.ini pin_swiss)
+//
+// The root swiss-gc.dol drawn on its own, centred one row above the grid. It acts as an
+// extra row on top of row 0: UP from the top row selects it, DOWN goes back to the column
+// you came from, and A/START boot it like any other entry (selected_slot holds the
+// reserved GM_SWISS_PIN_SLOT while it is selected, and gm_get_game_entry answers it).
+// It is only shown while the list sits at its top, fading out as the grid scrolls down,
+// so the rows scrolling out of view never pass behind it.
+//
+// SWISS_PIN_POS_X / SWISS_PIN_RAW_Y are the knobs if it needs nudging on a real screen:
+// X is in the same units as setup_icon_positions (0 = centre, a column is 56), Y is in the
+// grid's raw space (grid row 0 sits at DRAW_BOUND_TOP; smaller = higher on screen).
+// ---------------------------------------------------------------------------------------
+#define SWISS_PIN_POS_X 0.0f
+#define SWISS_PIN_RAW_Y ((f32)(DRAW_BOUND_TOP - DRAW_OFFSET_Y))
+#define SWISS_PIN_FADE_STEP 0.08f
+
+static f32 swiss_pin_fade = 0.0f;
+static int swiss_pin_return_col = 0;
+
+static void draw_swiss_pin(u8 alpha) {
+    bool present = gm_swiss_pin_present();
+    bool selected = present && selected_slot == GM_SWISS_PIN_SLOT;
+
+    f32 target = (present && (top_line_num == 0 || selected)) ? 1.0f : 0.0f;
+    if (swiss_pin_fade < target) {
+        swiss_pin_fade += SWISS_PIN_FADE_STEP;
+        if (swiss_pin_fade > target) swiss_pin_fade = target;
+    } else if (swiss_pin_fade > target) {
+        swiss_pin_fade -= SWISS_PIN_FADE_STEP;
+        if (swiss_pin_fade < target) swiss_pin_fade = target;
+    }
+    if (!present || swiss_pin_fade <= 0.0f) return;
+
+    static position_t pos;
+    C_MTXIdentity(pos.m);
+    pos.opacity = swiss_pin_fade;
+
+    f32 real_position_y = SCREEN_BOUND_TOP - SWISS_PIN_RAW_Y;
+    if (selected) {
+        pos.scale = 2.0;
+        apply_save_rot(selected_icon_mod.rot_diff_x, selected_icon_mod.rot_diff_y, selected_icon_mod.rot_diff_z, pos.m);
+        pos.m[0][3] = SWISS_PIN_POS_X + selected_icon_mod.move_diff_y;
+        pos.m[1][3] = real_position_y - selected_icon_mod.move_diff_z;
+        pos.m[2][3] = 2.0;
+    } else {
+        pos.scale = 1.3;
+        pos.m[0][3] = SWISS_PIN_POS_X;
+        pos.m[1][3] = real_position_y;
+        pos.m[2][3] = 1.0;
+    }
+
+    draw_save_icon(&pos, (u32)GM_SWISS_PIN_SLOT, alpha, selected);
+}
+
 
 __attribute_data__ Mtx global_gameselect_matrix;
 __attribute_data__ Mtx global_gameselect_inverse;
@@ -1029,6 +1085,9 @@ __attribute_used__ void custom_gameselect_menu(u8 broken_alpha_0, u8 alpha_1, u8
             }
         }
     }
+
+    // pinned Swiss tile, above the grid
+    draw_swiss_pin(alpha_1);
 
     // arrows
     fix_gameselect_view();
@@ -1481,6 +1540,21 @@ __attribute_used__ s32 handle_gameselect_inputs() {
         *bs2start_ready = 1;
     }
 
+    if (current_gameselect_state == SUBMENU_GAMESELECT_LOADER && selected_slot == GM_SWISS_PIN_SLOT) {
+        if (!gm_swiss_pin_present()) {
+            // Turned off or gone underneath us: fall back into the grid.
+            selected_slot = swiss_pin_return_col;
+        } else if (pad_status->analog_down & ANALOG_DOWN) {
+            // Back into row 0, in the column UP was pressed from. The list is always at its
+            // top here (the tile is only reachable from row 0 of an unscrolled list).
+            Jac_PlaySe(SOUND_CARD_MOVE);
+            selected_slot = swiss_pin_return_col;
+        } else if (pad_status->analog_down & (ANALOG_UP | ANALOG_LEFT | ANALOG_RIGHT)) {
+            Jac_PlaySe(SOUND_CARD_ERROR);
+        }
+        return MENU_GAMESELECT_TRANSITION_ID;
+    }
+
     if (current_gameselect_state == SUBMENU_GAMESELECT_LOADER) {
         if (pad_status->analog_down & ANALOG_RIGHT) {
             if ((selected_slot % columns_per_line) == (columns_per_line - 1)) {
@@ -1524,7 +1598,14 @@ __attribute_used__ s32 handle_gameselect_inputs() {
         if (pad_status->analog_down & ANALOG_UP) {
             if (top_line_num == 0 && (selected_slot - columns_per_line) < 0) {
                 // OSReport("SKIP MOVE UP: top_line_num = %d\n", top_line_num);
-                Jac_PlaySe(SOUND_CARD_ERROR);
+                if (gm_swiss_pin_present()) {
+                    // Top row of an unscrolled list: the pinned Swiss tile sits above it.
+                    Jac_PlaySe(SOUND_CARD_MOVE);
+                    swiss_pin_return_col = selected_slot % columns_per_line;
+                    selected_slot = GM_SWISS_PIN_SLOT;
+                } else {
+                    Jac_PlaySe(SOUND_CARD_ERROR);
+                }
             } else {
                 Jac_PlaySe(SOUND_CARD_MOVE);
                 line_backing_t *line_backing = &browser_lines[selected_slot / columns_per_line];
