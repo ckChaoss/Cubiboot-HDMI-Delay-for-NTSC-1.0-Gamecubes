@@ -482,6 +482,9 @@ static bool using_extruded_cubes() {
     return force_banner_cube || menu_grid_type == MENU_GRID_BANNERS || menu_grid_type == MENU_GRID_SMALL_BANNERS;
 }
 
+// 60 Hz tick for animated save icons, advanced once per frame by custom_gameselect_menu.
+static u32 icon_anim_tick = 0;
+
 __attribute_used__ void draw_save_icon(position_t *pos, u32 slot_num, u8 alpha, bool selected) {
     f32 sc = pos->scale;
     guVector scale = {sc, sc, sc};
@@ -546,7 +549,7 @@ __attribute_used__ void draw_save_icon(position_t *pos, u32 slot_num, u8 alpha, 
                 const uint8_t *default_icon = entry->type == GM_FILE_TYPE_DIRECTORY ? &dir_tex_bin[0] : &dol_tex_bin[0];
                 target_texture_data = (u32)default_icon;
             } else {
-                target_texture_data = (u32)entry->asset.icon.buf->data;
+                target_texture_data = (u32)gm_icon_frame_data(entry->asset.icon.buf, icon_anim_tick);
             }
 
             s32 desired_offset = (s32)((u32)target_texture_data - (u32)icon_tex);
@@ -1029,6 +1032,8 @@ __attribute_data__ u32 current_gameselect_state = SUBMENU_GAMESELECT_LOADER;
 // of the renderer which Cubiboot normally skips for its custom browser.
 __attribute_data__ u32 stock_disc_mode = 0;
 __attribute_used__ void custom_gameselect_menu(u8 broken_alpha_0, u8 alpha_1, u8 broken_alpha_2) {
+    icon_anim_tick++; // animated save icons
+
     // color
     u8 ui_alpha = alpha_1;
     // u8 ui_alpha = alpha_2; // correct with animation
