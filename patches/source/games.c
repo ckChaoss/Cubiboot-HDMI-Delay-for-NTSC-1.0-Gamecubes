@@ -363,7 +363,10 @@ void gm_icon_free(gm_icon_t *icon) {
     // memset(icon->buf->data, 0, ICON_PIXELDATA_LEN); // test only
     gm_free_icon_buf(icon->buf);
     icon->buf = NULL;
-    icon->state = GM_LOAD_STATE_UNLOADED;
+    // NONE, not UNLOADED: the draw code reads icon->buf for any state but NONE, and the
+    // ARAM reload that UNLOADED was for is not used (save icons are read straight into
+    // the pool and stay resident until the folder changes).
+    icon->state = GM_LOAD_STATE_NONE;
 }
 
 // Banners are kept resident in MRAM (no ARAM streaming). The original async
@@ -903,6 +906,284 @@ static bool gm_load_icon(gm_file_entry_t *entry, u32 aram_offset, bool force_unl
 
 #endif
 
+// ---------------------------------------------------------------------------------------
+// Save icons (config.ini save_icons, on by default)
+//
+// A game whose save is on Swiss's emulated memory card A shows that save's icon on its
+// cube. Swiss keeps that card as a raw card image on the SD card, one per region:
+//     /swiss/saves/MemoryCardA.USA.raw   (EUR / JPN likewise)
+// The image is read, never written: the directory and block map are read once per folder
+// scan, then for each game with a save, frame 0 of its icon is read and converted to the
+// RGB5A3 the cube draws, into the existing icon pool (gm_icon_pool, 128 slots that were
+// already reserved and unused). Nothing new is allocated statically -- the directory and
+// map buffers come from the games heap and are freed again when the scan ends.
+//
+// Card image layout (8 KiB blocks): 0 header, 1-2 directory (two copies), 3-4 block map
+// (two copies), 5+ file data. The copy with the higher update counter is the live one.
+// ---------------------------------------------------------------------------------------
+extern u32 save_icons;
+
+#define GM_CARD_BLOCK      0x2000
+#define GM_CARD_DIR_COUNT  127
+#define GM_CARD_DATA_START 5
+
+typedef struct {
+    u8  gamecode[4];
+    u8  company[2];
+    u8  pad0;
+    u8  banner_fmt;
+    u8  filename[32];
+    u32 mtime;
+    u32 icon_addr;
+    u16 icon_fmt;
+    u16 icon_speed;
+    u8  permission;
+    u8  copy_times;
+    u16 start_block;
+    u16 block_count;
+    u8  pad1[2];
+    u32 comment_addr;
+} gm_card_dirent_t;
+_Static_assert(sizeof(gm_card_dirent_t) == 0x40, "card directory entry is 64 bytes");
+
+typedef struct {
+    bool tried;
+    bool ok;
+    char path[40];
+    u32 blocks;        // blocks in the image
+    u8 *dir;           // live directory block (8 KiB, heap)
+    u8 *bat;           // live block map (8 KiB, heap)
+} gm_card_t;
+
+// 0 = USA, 1 = EUR, 2 = JPN. Heap-allocated per scan (see gm_save_icons_begin).
+static gm_card_t *gm_cards = NULL;
+static u8 *gm_icon_scratch = NULL; // one raw frame + palette (2 KiB + 512)
+
+static const char *gm_card_region_names[3] = { "USA", "EUR", "JPN" };
+
+// Swiss picks the card from the disc's region; the 4th letter of the game id says the
+// same thing for practically every disc.
+static int gm_card_region(const u8 *game_id) {
+    switch (game_id[3]) {
+        case 'J': return 2;
+        case 'E': return 0;
+        case 'P': case 'D': case 'F': case 'S': case 'I':
+        case 'X': case 'Y': case 'U': case 'H': return 1;
+        default: return 0;
+    }
+}
+
+// One open/read/close per call: the SD file layer keeps a single open file, and the
+// game scan around us opens other files in between.
+static bool gm_card_read(gm_card_t *card, u32 offset, u32 len, void *dst) {
+    if (dvd_custom_open(card->path, FILE_ENTRY_TYPE_FILE, IPC_FILE_FLAG_DISABLECACHE) != 0)
+        return false;
+    file_status_t *status = dvd_custom_status();
+    if (status == NULL || status->result != 0)
+        return false;
+    int r = dvd_read_data(dst, len, offset, status->fd);
+    dvd_custom_close(status->fd);
+    return r == 0;
+}
+
+static inline u16 gm_be16(const u8 *p) { return (u16)((p[0] << 8) | p[1]); }
+
+static bool gm_card_open(gm_card_t *card, int region) {
+    if (card->tried) return card->ok;
+    card->tried = true;
+    card->ok = false;
+
+    snprintf(card->path, sizeof(card->path), "/swiss/saves/MemoryCardA.%s.raw", gm_card_region_names[region]);
+    if (dvd_custom_open(card->path, FILE_ENTRY_TYPE_FILE, IPC_FILE_FLAG_DISABLECACHE) != 0)
+        return false;
+    file_status_t *status = dvd_custom_status();
+    if (status == NULL || status->result != 0)
+        return false;
+    u32 fsize = (u32)__builtin_bswap64(*(u64*)&status->fsize);
+    dvd_custom_close(status->fd);
+
+    card->blocks = fsize / GM_CARD_BLOCK;
+    if (card->blocks <= GM_CARD_DATA_START) {
+        OSReport("Save icons: %s is too small (%u bytes)\n", card->path, fsize);
+        return false;
+    }
+
+    // Both copies of each, then keep the newer. Directory update counter sits at 0x1FFA,
+    // the block map's at 0x04.
+    card->dir = gm_malloc(GM_CARD_BLOCK);
+    card->bat = gm_malloc(GM_CARD_BLOCK);
+    if (card->dir == NULL || card->bat == NULL)
+        return false;
+
+    u8 *other = gm_malloc(GM_CARD_BLOCK);
+    if (other == NULL)
+        return false;
+
+    bool ok = gm_card_read(card, 1 * GM_CARD_BLOCK, GM_CARD_BLOCK, card->dir) &&
+              gm_card_read(card, 2 * GM_CARD_BLOCK, GM_CARD_BLOCK, other);
+    if (ok && (s16)gm_be16(&other[0x1FFA]) > (s16)gm_be16(&card->dir[0x1FFA]))
+        memcpy(card->dir, other, GM_CARD_BLOCK);
+
+    ok = ok && gm_card_read(card, 3 * GM_CARD_BLOCK, GM_CARD_BLOCK, card->bat) &&
+               gm_card_read(card, 4 * GM_CARD_BLOCK, GM_CARD_BLOCK, other);
+    if (ok && (s16)gm_be16(&other[0x04]) > (s16)gm_be16(&card->bat[0x04]))
+        memcpy(card->bat, other, GM_CARD_BLOCK);
+
+    gm_free(other);
+    if (!ok) {
+        OSReport("Save icons: could not read %s\n", card->path);
+        return false;
+    }
+
+    OSReport("Save icons: using %s\n", card->path);
+    card->ok = true;
+    return true;
+}
+
+// Reads `len` bytes at `offset` into the save's own data, following the block map --
+// a save is not guaranteed to sit in consecutive blocks.
+static bool gm_card_read_file(gm_card_t *card, const gm_card_dirent_t *de, u32 offset, u32 len, u8 *dst) {
+    u16 block = de->start_block;
+    u32 skip = offset / GM_CARD_BLOCK;
+    u32 in_block = offset % GM_CARD_BLOCK;
+
+    for (u32 i = 0; i < skip; i++) {
+        if (block < GM_CARD_DATA_START || block >= card->blocks) return false;
+        block = gm_be16(&card->bat[0x0A + 2 * (block - GM_CARD_DATA_START)]);
+    }
+
+    while (len > 0) {
+        if (block < GM_CARD_DATA_START || block >= card->blocks) return false;
+        u32 chunk = GM_CARD_BLOCK - in_block;
+        if (chunk > len) chunk = len;
+        if (!gm_card_read(card, (u32)block * GM_CARD_BLOCK + in_block, chunk, dst)) return false;
+        dst += chunk;
+        len -= chunk;
+        in_block = 0;
+        if (len > 0) block = gm_be16(&card->bat[0x0A + 2 * (block - GM_CARD_DATA_START)]);
+    }
+    return true;
+}
+
+// Icon frame formats, two bits per frame in icon_fmt.
+#define GM_ICON_NONE      0
+#define GM_ICON_CI8_SHARE 1  // 1 KiB pixels; one palette after the last frame
+#define GM_ICON_RGB5A3    2  // 2 KiB pixels
+#define GM_ICON_CI8       3  // 1 KiB pixels + its own 512-byte palette
+
+static u32 gm_icon_frame_size(int fmt) {
+    switch (fmt) {
+        case GM_ICON_CI8_SHARE: return 0x400;
+        case GM_ICON_RGB5A3:    return 0x800;
+        case GM_ICON_CI8:       return 0x400 + 0x200;
+        default:                return 0;
+    }
+}
+
+// CI8 is stored in 8x4-pixel tiles, RGB5A3 in 4x4 tiles; both 32x32 here.
+static void gm_icon_ci8_to_rgb5a3(const u8 *ci8, const u8 *palette, u8 *out) {
+    for (int y = 0; y < 32; y++) {
+        for (int x = 0; x < 32; x++) {
+            int src = ((y / 4) * 4 + (x / 8)) * 32 + (y % 4) * 8 + (x % 8);
+            int dst = (((y / 4) * 8 + (x / 4)) * 16 + (y % 4) * 4 + (x % 4)) * 2;
+            u8 index = ci8[src];
+            out[dst]     = palette[index * 2];
+            out[dst + 1] = palette[index * 2 + 1];
+        }
+    }
+}
+
+// Frame 0 of this game's save icon into the icon pool. Quietly does nothing when the game
+// has no save, the save has no icon, or the pool is full -- the cube keeps its banner.
+static void gm_load_save_icon(gm_file_entry_t *entry) {
+    if (gm_cards == NULL || gm_icon_scratch == NULL) return;
+
+    gm_card_t *card = &gm_cards[gm_card_region(entry->extra.game_id)];
+    if (!gm_card_open(card, gm_card_region(entry->extra.game_id))) return;
+
+    const gm_card_dirent_t *de = NULL;
+    for (int i = 0; i < GM_CARD_DIR_COUNT; i++) {
+        const gm_card_dirent_t *d = (const gm_card_dirent_t *)&card->dir[i * sizeof(gm_card_dirent_t)];
+        if (d->gamecode[0] == 0xFF) continue; // empty slot
+        if (memcmp(d->gamecode, entry->extra.game_id, 4) != 0) continue;
+        if (memcmp(d->company, &entry->extra.game_id[4], 2) != 0) continue;
+        if (d->icon_addr == 0xFFFFFFFF || (d->icon_fmt & 3) == GM_ICON_NONE) continue;
+        de = d;
+        break;
+    }
+    if (de == NULL) return;
+
+    // Skip the banner, if the save has one, to reach the icon frames.
+    u32 pos = de->icon_addr;
+    switch (de->banner_fmt & 3) {
+        case 1: pos += 96 * 32 + 0x200; break; // CI8 + palette
+        case 2: pos += 96 * 32 * 2; break;     // RGB5A3
+    }
+
+    // The animation is the frames up to the first one with a speed of 0, and a shared
+    // palette follows the last of those (same reading as Dolphin's GCMemcard).
+    int fmt0 = de->icon_fmt & 3;
+    if ((de->icon_speed & 3) == 0) return; // no frames at all
+    u32 shared_palette = pos;
+    for (int f = 0; f < 8; f++) {
+        if (((de->icon_speed >> (2 * f)) & 3) == 0) break;
+        shared_palette += gm_icon_frame_size((de->icon_fmt >> (2 * f)) & 3);
+    }
+
+    gm_icon_buf_t *slot = gm_get_icon_buf();
+    if (slot == NULL) return; // pool full: this one keeps its banner
+
+    u8 *raw = gm_icon_scratch;
+    bool ok;
+    if (fmt0 == GM_ICON_RGB5A3) {
+        ok = gm_card_read_file(card, de, pos, 0x800, slot->data);
+    } else {
+        u32 pal_at = (fmt0 == GM_ICON_CI8) ? pos + 0x400 : shared_palette;
+        ok = gm_card_read_file(card, de, pos, 0x400, raw) &&
+             gm_card_read_file(card, de, pal_at, 0x200, raw + 0x400);
+        if (ok) gm_icon_ci8_to_rgb5a3(raw, raw + 0x400, slot->data);
+    }
+
+    if (!ok) {
+        gm_free_icon_buf(slot);
+        return;
+    }
+
+    DCFlushRange(slot->data, ICON_PIXELDATA_LEN);
+    entry->asset.icon.buf = slot;
+    entry->asset.icon.state = GM_LOAD_STATE_LOADED;
+}
+
+static void gm_save_icons_begin(void) {
+    gm_cards = NULL;
+    gm_icon_scratch = NULL;
+    if (!save_icons) return;
+
+    gm_cards = gm_malloc(sizeof(gm_card_t) * 3);
+    gm_icon_scratch = gm_malloc(0x400 + 0x200);
+    if (gm_cards == NULL || gm_icon_scratch == NULL) {
+        if (gm_cards) gm_free(gm_cards);
+        if (gm_icon_scratch) gm_free(gm_icon_scratch);
+        gm_cards = NULL;
+        gm_icon_scratch = NULL;
+        return;
+    }
+    memset(gm_cards, 0, sizeof(gm_card_t) * 3);
+}
+
+static void gm_save_icons_end(void) {
+    if (gm_cards != NULL) {
+        for (int i = 0; i < 3; i++) {
+            if (gm_cards[i].dir) gm_free(gm_cards[i].dir);
+            if (gm_cards[i].bat) gm_free(gm_cards[i].bat);
+        }
+        gm_free(gm_cards);
+    }
+    if (gm_icon_scratch != NULL) gm_free(gm_icon_scratch);
+    gm_cards = NULL;
+    gm_icon_scratch = NULL;
+}
+
 void gm_check_files(int path_count) {
     // Here we will also check for override assets and matching save icons
     u32 aram_offset = (1 * 1024 * 1024); // 1MB mark
@@ -911,6 +1192,8 @@ void gm_check_files(int path_count) {
     gm_evict_on_scroll = false;
 
     char app_dol_path[GM_PATH_MAX];
+
+    gm_save_icons_begin();
 
     // Enumerate all of the games
     u64 start_time = gettime();
@@ -976,8 +1259,10 @@ void gm_check_files(int path_count) {
             }
             aram_offset += BNR_PIXELDATA_LEN;
 
-            // load the icon
+            // load the icon: the one from this game's save on Swiss's memory card A, if
+            // there is one (gm_load_save_icon). The cube draws it in place of the banner.
             backing->asset.use_banner = true;
+            gm_load_save_icon(backing);
 
             // bool icon_loaded = gm_load_icon(backing, aram_offset, force_unload);
             // if (!icon_loaded) {
@@ -1058,6 +1343,8 @@ void gm_check_files(int path_count) {
         // udelay_threaded(100 * 1000); // test only
         game_backing_count = gm_entry_count;
     }
+
+    gm_save_icons_end();
 
     OSReport("Total entries = %d\n", gm_entry_count);
 
