@@ -233,6 +233,7 @@ void load_settings() {
     settings.show_watermark = ini_get_bool(conf, "show_watermark", 0);
     settings.disable_mcp_select = ini_get_bool(conf, "disable_mcp_select", 0);
     settings.remember_last_game = ini_get_bool(conf, "remember_last_game", 0);
+    settings.pin_swiss = ini_get_bool(conf, "pin_swiss", 1);
 
     // which storage the loader and the menu read from, most wanted first
     const char *device_order = ini_get(conf, "cubeboot", "device_order");
