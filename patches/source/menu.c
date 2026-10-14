@@ -473,8 +473,13 @@ __attribute_used__ void custom_gameselect_init() {
 int selected_slot = 0;
 int top_line_num = 0;
 
+// Set only while the pinned Swiss tile is being drawn (draw_swiss_pin): that tile is always a
+// full-size banner cube, whatever menu_grid_type the grid itself uses. A local flag rather
+// than flipping menu_grid_type, which the enum thread reads to size the grid.
+static bool force_banner_cube = false;
+
 static bool using_extruded_cubes() {
-    return menu_grid_type == MENU_GRID_BANNERS || menu_grid_type == MENU_GRID_SMALL_BANNERS;
+    return force_banner_cube || menu_grid_type == MENU_GRID_BANNERS || menu_grid_type == MENU_GRID_SMALL_BANNERS;
 }
 
 __attribute_used__ void draw_save_icon(position_t *pos, u32 slot_num, u8 alpha, bool selected) {
@@ -482,7 +487,7 @@ __attribute_used__ void draw_save_icon(position_t *pos, u32 slot_num, u8 alpha, 
     guVector scale = {sc, sc, sc};
     bool use_extruded_models = using_extruded_cubes();
 
-    if (menu_grid_type == MENU_GRID_SMALL_BANNERS) {
+    if (menu_grid_type == MENU_GRID_SMALL_BANNERS && !force_banner_cube) {
         scale.x *= 0.75f;
         scale.y *= 0.75f;
         scale.z *= 0.75f;
@@ -784,6 +789,11 @@ __attribute_used__ void update_icon_positions() {
 #define SWISS_PIN_POS_X 0.0f
 #define SWISS_PIN_RAW_Y ((f32)(DRAW_BOUND_TOP - DRAW_OFFSET_Y))
 #define SWISS_PIN_FADE_STEP 0.08f
+// The tile is always a banner-shaped cube (wide, like menu_grid_type = banners), even when the
+// grid is square_icons or small_banners. These are its sizes, unselected and selected; the
+// banners layout uses 1.3 / 2.0, so raise them for an even bigger tile.
+#define SWISS_PIN_SCALE          1.3f
+#define SWISS_PIN_SCALE_SELECTED 2.0f
 
 static f32 swiss_pin_fade = 0.0f;
 static int swiss_pin_return_col = 0;
@@ -808,19 +818,26 @@ static void draw_swiss_pin(u8 alpha) {
 
     f32 real_position_y = SCREEN_BOUND_TOP - SWISS_PIN_RAW_Y;
     if (selected) {
-        pos.scale = 2.0;
-        apply_save_rot(selected_icon_mod.rot_diff_x, selected_icon_mod.rot_diff_y, selected_icon_mod.rot_diff_z, pos.m);
+        pos.scale = SWISS_PIN_SCALE_SELECTED;
+        // The wobble is tuned per layout (update_icon_positions); a square-icon grid computes
+        // it for a square cube, which swings a 3x wider banner cube too far, so scale the
+        // yaw down the same way the banner layouts do.
+        s32 rot_y = selected_icon_mod.rot_diff_y;
+        if (!using_extruded_cubes()) rot_y /= 3;
+        apply_save_rot(selected_icon_mod.rot_diff_x, rot_y, selected_icon_mod.rot_diff_z, pos.m);
         pos.m[0][3] = SWISS_PIN_POS_X + selected_icon_mod.move_diff_y;
         pos.m[1][3] = real_position_y - selected_icon_mod.move_diff_z;
         pos.m[2][3] = 2.0;
     } else {
-        pos.scale = 1.3;
+        pos.scale = SWISS_PIN_SCALE;
         pos.m[0][3] = SWISS_PIN_POS_X;
         pos.m[1][3] = real_position_y;
         pos.m[2][3] = 1.0;
     }
 
+    force_banner_cube = true;
     draw_save_icon(&pos, (u32)GM_SWISS_PIN_SLOT, alpha, selected);
+    force_banner_cube = false;
 }
 
 
