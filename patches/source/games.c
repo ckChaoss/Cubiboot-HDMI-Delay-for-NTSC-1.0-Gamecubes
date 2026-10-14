@@ -1,5 +1,3 @@
-
-
 // The concept here is that we have a thread which can be started and performs 3 actions in order
 // 1. List all of the games in target_dir and sort them by name (only including certain file extensions)
 // 2. Enumerate all of the games and evaluate if they are valid by checking their headers
@@ -91,7 +89,43 @@ int gm_pending_last_played_slot = -1;
 static bool gm_scan_is_last_played = false;
 static char gm_last_played_path[MAX_FILE_NAME];
 
+// The pinned Swiss tile (pin_swiss in config.ini): the root swiss-gc.dol drawn on its own
+// above the grid instead of as a cube inside it. It is not part of the folder list, so it
+// lives outside gm_entry_backing and is reached through the reserved GM_SWISS_PIN_SLOT
+// index. Kept in lowmem (NOLOAD) so it does not grow the loader image -- see the warning
+// in gm_thread_worker about what an 8KB growth did to Swiss launches. Being NOLOAD it holds
+// garbage until gm_swiss_pin_setup fills it, and nothing reads it before then.
+__attribute_aligned_data_lowmem__ static gm_file_entry_t gm_swiss_pin_entry;
+static bool gm_swiss_pin_ready = false;
+
+#define GM_SWISS_PIN_PATH "/swiss-gc.dol"
+
+static void gm_swiss_pin_setup(void) {
+    if (gm_swiss_pin_ready) return;
+
+    memset(&gm_swiss_pin_entry, 0, sizeof(gm_swiss_pin_entry));
+    strcpy(gm_swiss_pin_entry.path, GM_SWISS_PIN_PATH);
+    gm_swiss_pin_entry.type = GM_FILE_TYPE_PROGRAM;
+    gm_swiss_pin_entry.asset.use_banner = false;
+    gm_swiss_pin_entry.asset.icon.state = GM_LOAD_STATE_NONE; // -> the stock DOL icon
+    gm_swiss_pin_entry.asset.banner.state = GM_LOAD_STATE_NONE;
+    strcpy(gm_swiss_pin_entry.desc.fullGameName, "Swiss");
+    strcpy(gm_swiss_pin_entry.desc.description, "Open Swiss (swiss-gc.dol)");
+    gm_swiss_pin_entry.second = NULL;
+
+    DCFlushRange(&gm_swiss_pin_entry, sizeof(gm_swiss_pin_entry));
+    gm_swiss_pin_ready = true;
+}
+
+// True when the tile should be drawn and selectable: switched on in config.ini, Swiss
+// actually found at mount time, and the entry filled in by the enum thread.
+bool gm_swiss_pin_present(void) {
+    return pin_swiss && gm_swiss_pin_ready && emu_found_swiss();
+}
+
 gm_file_entry_t *gm_get_game_entry(int index) {
+    if (index == GM_SWISS_PIN_SLOT) return gm_swiss_pin_present() ? &gm_swiss_pin_entry : NULL;
+    if (index < 0) return NULL;
     if (index >= gm_entry_count) return NULL;
     return gm_entry_backing[index];
 }
@@ -583,6 +617,12 @@ gm_list_info gm_list_files(const char *target_dir) {
         }
 
         if (file_type == GM_FILE_TYPE_UNKNOWN) continue; // check if the file is valid
+
+        // The root swiss-gc.dol has its own pinned tile above the grid, so it is not listed
+        // a second time among the games. Only the root copy -- a Swiss kept in a folder or
+        // as an app still shows where it is.
+        if (gm_swiss_pin_present() && strcmp(target_dir, "/") == 0 &&
+            strcasecmp(ent.name, GM_SWISS_PIN_PATH + 1) == 0) continue;
 
 #ifdef PRINT_READDIR_NAMES
         // logging
@@ -1449,6 +1489,7 @@ void *gm_thread_worker(void* param) {
     gm_scan_stopped = false;
     gm_scan_complete = false;
     gm_load_cube_logo();
+    gm_swiss_pin_setup(); // before the listing, which hides the root copy once it is pinned
 
     if (gm_cold_boot_resolve) {
         gm_cold_boot_resolve = false;
@@ -1622,4 +1663,3 @@ void gm_deinit_thread() {
         OSUnlockMutex(game_enum_mutex);
     }
 }
-
