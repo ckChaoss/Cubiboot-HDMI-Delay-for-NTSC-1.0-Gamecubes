@@ -121,6 +121,12 @@ extern int gm_pending_last_played_slot;
 void gm_apply_pending_last_played();              // menu thread: jump to pending slot
 char *gm_last_played_folder(void);                // startup: folder containing last game, or NULL
 
+// Pinned Swiss tile (config.ini pin_swiss): a reserved slot index that gm_get_game_entry
+// answers with the root swiss-gc.dol. selected_slot holds it while the tile is selected.
+#define GM_SWISS_PIN_SLOT (-1)
+extern u32 pin_swiss;
+bool gm_swiss_pin_present(void);
+
 void gm_init_heap();
 void gm_init_thread();
 void gm_deinit_thread();
