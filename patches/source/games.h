@@ -127,6 +127,9 @@ char *gm_last_played_folder(void);                // startup: folder containing 
 extern u32 pin_swiss;
 bool gm_swiss_pin_present(void);
 
+// Save icons: the frame of an icon to draw at `tick` (60 Hz), animated or still.
+const u8 *gm_icon_frame_data(gm_icon_buf_t *first, u32 tick);
+
 void gm_init_heap();
 void gm_init_thread();
 void gm_deinit_thread();
