@@ -47,6 +47,8 @@ __attribute_data__ u8 *cube_text_tex = NULL; // set by gm_load_cube_logo (games.
 __attribute_data__ char cube_logo_path[MAX_FILE_NAME] = {0};
 __attribute_data__ char default_folder[MAX_FILE_NAME] = {0};
 __attribute_data__ u32 remember_last_game = 0;
+// On by default: the root swiss-gc.dol gets its own tile above the grid (games.c, menu.c).
+__attribute_data__ u32 pin_swiss = 1;
 __attribute_data__ u32 force_progressive = 0;
 __attribute_data__ u32 force_widescreen = 0;
 // On by default: a physical disc boots through Swiss unless config.ini turns it off.
