@@ -51,6 +51,8 @@ __attribute_data__ u32 remember_last_game = 0;
 __attribute_data__ u32 pin_swiss = 1;
 // On by default: games show the icon from their save in Swiss's emulated memory card (games.c).
 __attribute_data__ u32 save_icons = 1;
+// Set by the loader on a return from In-Game Reset (igr_skip_intro): no boot animation.
+__attribute_data__ u32 skip_intro = 0;
 __attribute_data__ u32 force_progressive = 0;
 __attribute_data__ u32 force_widescreen = 0;
 // On by default: a physical disc boots through Swiss unless config.ini turns it off.
@@ -586,6 +588,11 @@ __attribute_used__ u32 bs2tick() {
 #ifdef TEST_SKIP_ANIMATION
     return STATE_COVER_OPEN;
 #endif
+
+    // Back from In-Game Reset (config.ini igr_skip_intro): straight to the game list.
+    if (skip_intro) {
+        return STATE_COVER_OPEN;
+    }
 
     // TODO: allow the user to decide if they want to logo to play
     return STATE_NO_DISC;
