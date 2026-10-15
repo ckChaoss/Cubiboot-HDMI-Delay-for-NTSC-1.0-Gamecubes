@@ -62,6 +62,16 @@ GXRModeObj *rmode;
 // this will be used during system init
 void *__attribute__((used)) __myArena1Hi = (void*)BS2_BASE_ADDR;
 
+// The copy of this loader inside apploader.img (Swiss's In-Game Reset) is told apart from the
+// one that cold-boots by this marker: .ci/build_apploader.sh finds it in the ELF it packs and
+// turns the trailing 0 into 1. Nothing is built twice, and the ipl.dol keeps the 0. volatile so
+// the compiler reads the byte instead of folding the constant.
+static volatile const char igr_copy_marker[] = "CUBIBOOT-IGR-COPY:0";
+
+static bool is_igr_copy(void) {
+    return igr_copy_marker[sizeof(igr_copy_marker) - 2] == '1';
+}
+
 int main(int argc, char **argv) {
     u64 startts, endts;
 
@@ -322,6 +332,13 @@ int main(int argc, char **argv) {
     set_patch_value(symshdr, syment, symstringdata, "pin_swiss", settings.pin_swiss);
     set_patch_value(symshdr, syment, symstringdata, "save_icons", settings.save_icons);
     set_patch_value(symshdr, syment, symstringdata, "show_watermark", settings.show_watermark);
+
+    // Back from an in-game reset: straight to the game list instead of the boot animation,
+    // after the IGR black hold (igr_delay_ms) in place of the preboot one.
+    bool igr_skip = settings.igr_skip_intro && is_igr_copy();
+    iprintf("igr copy = %d, skip intro = %d\n", is_igr_copy(), igr_skip);
+    if (igr_skip) settings.preboot_delay_ms = settings.igr_delay_ms;
+    set_patch_value(symshdr, syment, symstringdata, "skip_intro", igr_skip);
 
     set_patch_value(symshdr, syment, symstringdata, "preboot_delay_ms", settings.preboot_delay_ms);
 	set_patch_value(symshdr, syment, symstringdata, "preboot_black_hold", current_bios->version == IPL_NTSC_10);
