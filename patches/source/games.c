@@ -181,6 +181,8 @@ static inline gm_icon_buf_t *gm_get_icon_buf() {
     return NULL;
 }
 
+static int gm_count_free_icon_bufs(void);
+
 static inline void gm_free_icon_buf(gm_icon_buf_t *buf) {
     if (buf == NULL) return;
     buf->used = 0;
@@ -209,6 +211,13 @@ static inline gm_banner_buf_t *gm_get_banner_buf() {
 static inline void gm_free_banner_buf(gm_banner_buf_t *buf) {
     if (buf == NULL) return;
     buf->used = 0;
+}
+
+static int gm_count_free_icon_bufs(void) {
+    int count = 0;
+    for (int i = 0; i < ASSET_BUFFER_COUNT; i++)
+        if (gm_icon_pool[i].used == 0) count++;
+    return count;
 }
 
 static int gm_count_banner_buf() {
@@ -975,14 +984,38 @@ static int gm_card_region(const u8 *game_id) {
 
 // One open/read/close per call: the SD file layer keeps a single open file, and the
 // game scan around us opens other files in between.
+//
+// Opening a file is the slow part on the SD card, so while one game's icon is being read
+// the file is kept open between reads (gm_path_hold / gm_path_release). It is always closed
+// again before anything else can open a file: the file layer has only one open file.
+static bool gm_path_held = false;
+static char gm_path_held_name[160];
+static u8 gm_path_held_fd = 0;
+
+static void gm_path_release(void) {
+    if (!gm_path_held) return;
+    dvd_custom_close(gm_path_held_fd);
+    gm_path_held = false;
+}
+
 static bool gm_path_read(const char *path, u32 offset, u32 len, void *dst) {
+    if (gm_path_held && strcmp(gm_path_held_name, path) == 0)
+        return dvd_read_data(dst, len, offset, gm_path_held_fd) == 0;
+
+    gm_path_release();
     if (dvd_custom_open((char *)path, FILE_ENTRY_TYPE_FILE, IPC_FILE_FLAG_DISABLECACHE) != 0)
         return false;
     file_status_t *status = dvd_custom_status();
     if (status == NULL || status->result != 0)
         return false;
     int r = dvd_read_data(dst, len, offset, status->fd);
-    dvd_custom_close(status->fd);
+    if (r == 0 && strlen(path) < sizeof(gm_path_held_name)) {
+        strcpy(gm_path_held_name, path);
+        gm_path_held_fd = status->fd;
+        gm_path_held = true; // kept open for the next read of the same file
+    } else {
+        dvd_custom_close(status->fd);
+    }
     return r == 0;
 }
 
@@ -998,6 +1031,7 @@ static bool gm_card_open(gm_card_t *card, int region) {
     card->ok = false;
 
     snprintf(card->path, sizeof(card->path), "/swiss/saves/MemoryCardA.%s.raw", gm_card_region_names[region]);
+    gm_path_release();
     if (dvd_custom_open(card->path, FILE_ENTRY_TYPE_FILE, IPC_FILE_FLAG_DISABLECACHE) != 0)
         return false;
     file_status_t *status = dvd_custom_status();
@@ -1034,6 +1068,7 @@ static bool gm_card_open(gm_card_t *card, int region) {
         memcpy(card->bat, other, GM_CARD_BLOCK);
 
     gm_free(other);
+    gm_path_release();
     if (!ok) {
         OSReport("Save icons: could not read %s\n", card->path);
         return false;
@@ -1179,6 +1214,7 @@ static void gm_gci_index_build(void) {
     gm_gcis = NULL;
     gm_gci_count = 0;
 
+    gm_path_release();
     if (dvd_custom_open(GM_GCI_DIR, FILE_ENTRY_TYPE_DIR, 0) != 0) return; // no folder: fine
     file_status_t *status = dvd_custom_status();
     if (status == NULL || status->result != 0) return;
@@ -1220,6 +1256,7 @@ static void gm_gci_index_build(void) {
         gm_gcis[kept].hdr = hdr;
         kept++;
     }
+    gm_path_release();
     gm_gci_count = kept;
     OSReport("Save icons: %d .gci file(s) with icons in %s\n", kept, GM_GCI_DIR);
 }
@@ -1359,6 +1396,12 @@ static void gm_load_save_icon_anim(gm_file_entry_t *entry) {
     gm_icon_layout_t lo;
     if (!gm_icon_layout(src.de, &lo) || lo.count <= 1) return;
 
+    // Only start when the pool has room for every frame, so a full pool costs no reads.
+    int needed = 0;
+    for (int f = 1; f < lo.count; f++)
+        if (lo.fmt[f] != GM_ICON_NONE) needed++;
+    if (gm_count_free_icon_bufs() < needed) return;
+
     gm_icon_buf_t *first = entry->asset.icon.buf;
     gm_icon_buf_t *taken[8] = { 0 };
     u8 slots[8];
@@ -1406,7 +1449,127 @@ static void gm_load_save_icon_anim(gm_file_entry_t *entry) {
     a->count = (u8)n; // last: until now the draw code saw a still
 }
 
+// ---------------------------------------------------------------------------------------
+// Icons follow the screen. Only the rows on screen, plus a margin row either side, hold
+// save icons; rows that scroll away give their pool slots back. So the 128-slot icon
+// pool covers any folder size, the way the banner pool's sliding window does.
+//
+// Everything here runs on the menu thread (gm_icons_tick, called once per frame by the
+// grid's draw), never while the enum thread is scanning, so the pool and the entries are
+// only ever touched by one thread at a time. A scroll, a jump or a finished scan just marks
+// the window dirty; the next frame does the work.
+// ---------------------------------------------------------------------------------------
+static volatile bool gm_icons_dirty = false;
+
+void gm_icons_mark_dirty(void) {
+    gm_icons_dirty = true;
+}
+
+// Gives back every pool slot this icon holds (all its animation frames) and clears it.
+static void gm_save_icon_release(gm_file_entry_t *entry) {
+    gm_icon_t *icon = &entry->asset.icon;
+    if (icon->state != GM_LOAD_STATE_LOADED || icon->buf == NULL) return;
+
+    gm_icon_anim_t *a = GM_ICON_ANIM(icon->buf);
+    int n = a->count > 0 ? a->count : 1;
+    int first = gm_icon_slot_index(icon->buf);
+    icon->state = GM_LOAD_STATE_NONE; // first, so nothing draws from slots being freed
+    icon->buf = NULL;
+    for (int f = 0; f < n && f < 8; f++) {
+        int s = a->slot[f];
+        bool seen = false; // frames without pictures share another frame's slot
+        for (int k = 0; k < f; k++) if (a->slot[k] == s) seen = true;
+        if (!seen && s >= 0 && s < ASSET_BUFFER_COUNT) gm_free_icon_buf(&gm_icon_pool[s]);
+    }
+    gm_free_icon_buf(&gm_icon_pool[first]);
+}
+
+// Keeps this icon's first frame and gives back its animation frames.
+static void gm_save_icon_strip_anim(gm_file_entry_t *entry) {
+    gm_icon_t *icon = &entry->asset.icon;
+    if (icon->state != GM_LOAD_STATE_LOADED || icon->buf == NULL) return;
+    gm_icon_anim_t *a = GM_ICON_ANIM(icon->buf);
+    if (a->count <= 1) return;
+
+    int n = a->count;
+    int first = gm_icon_slot_index(icon->buf);
+    a->count = 1; // first, so the draw code goes back to the still
+    a->cycle = 0;
+    for (int f = 0; f < n && f < 8; f++) {
+        int s = a->slot[f];
+        bool seen = (s == first);
+        for (int k = 0; k < f; k++) if (a->slot[k] == s) seen = true;
+        if (!seen && s >= 0 && s < ASSET_BUFFER_COUNT) gm_free_icon_buf(&gm_icon_pool[s]);
+    }
+    a->slot[0] = (u8)first;
+}
+
+// One row above and below the screen hold stills, so icons are already in place when a row
+// scrolls in; only on-screen rows animate, so the whole pool goes to what you can see.
+#define GM_ICON_MARGIN_ROWS 1
+
+static void gm_icons_update_window(void) {
+    int cols = columns_per_line;
+    int vis_lo = top_line_num * cols;
+    int vis_hi = (top_line_num + DRAW_TOTAL_ROWS) * cols;
+    int lo = (top_line_num - GM_ICON_MARGIN_ROWS) * cols;
+    int hi = (top_line_num + DRAW_TOTAL_ROWS + GM_ICON_MARGIN_ROWS) * cols;
+    if (lo < 0) lo = 0;
+    if (vis_lo < 0) vis_lo = 0;
+    if (hi > gm_entry_count) hi = gm_entry_count;
+    if (vis_hi > gm_entry_count) vis_hi = gm_entry_count;
+
+    // 1. Rows that left the window give all their slots back.
+    for (int i = 0; i < gm_entry_count; i++) {
+        if (i >= lo && i < hi) continue;
+        gm_file_entry_t *e = gm_entry_backing[i];
+        if (e->type == GM_FILE_TYPE_GAME) gm_save_icon_release(e);
+    }
+
+    // 2. Stills for the games on screen.
+    for (int i = vis_lo; i < vis_hi; i++) {
+        gm_file_entry_t *e = gm_entry_backing[i];
+        if (e->type == GM_FILE_TYPE_GAME && e->asset.icon.state == GM_LOAD_STATE_NONE)
+            gm_load_save_icon(e);
+    }
+
+    // 3. The margin rows keep only their stills.
+    for (int i = lo; i < hi; i++) {
+        if (i >= vis_lo && i < vis_hi) continue;
+        gm_file_entry_t *e = gm_entry_backing[i];
+        if (e->type == GM_FILE_TYPE_GAME) gm_save_icon_strip_anim(e);
+    }
+
+    // 4. Animation for the games on screen, top to bottom, with the room that is left.
+    for (int i = vis_lo; i < vis_hi; i++) {
+        gm_file_entry_t *e = gm_entry_backing[i];
+        if (e->type != GM_FILE_TYPE_GAME || e->asset.icon.state != GM_LOAD_STATE_LOADED) continue;
+        if (GM_ICON_ANIM(e->asset.icon.buf)->count > 1) continue; // already animating
+        gm_load_save_icon_anim(e);
+    }
+
+    // 5. Stills for the margin rows last.
+    for (int i = lo; i < hi; i++) {
+        if (i >= vis_lo && i < vis_hi) continue;
+        gm_file_entry_t *e = gm_entry_backing[i];
+        if (e->type == GM_FILE_TYPE_GAME && e->asset.icon.state == GM_LOAD_STATE_NONE)
+            gm_load_save_icon(e);
+    }
+
+    gm_path_release(); // nothing stays open once the menu carries on
+}
+
+void gm_icons_tick(void) {
+    if (!gm_icons_dirty || game_enum_running) return;
+    if (!save_icons || gm_cards == NULL || gm_icon_scratch == NULL) return;
+    gm_icons_dirty = false;
+    gm_icons_update_window();
+}
+
+static void gm_save_icons_end(void);
+
 static void gm_save_icons_begin(void) {
+    gm_save_icons_end(); // the previous folder's card directories and .gci list
     gm_cards = NULL;
     gm_icon_scratch = NULL;
     if (!save_icons) return;
@@ -1425,6 +1588,7 @@ static void gm_save_icons_begin(void) {
 }
 
 static void gm_save_icons_end(void) {
+    gm_path_release();
     if (gm_cards != NULL) {
         for (int i = 0; i < 3; i++) {
             if (gm_cards[i].dir) gm_free(gm_cards[i].dir);
@@ -1515,10 +1679,15 @@ void gm_check_files(int path_count) {
             }
             aram_offset += BNR_PIXELDATA_LEN;
 
-            // load the icon: the one from this game's save on Swiss's memory card A, if
-            // there is one (gm_load_save_icon). The cube draws it in place of the banner.
+            // Save icons are not loaded here: the menu loads them for the rows on screen as
+            // you scroll (gm_icons_tick). The scan only opens this game's region card once,
+            // so that file read happens here rather than in the middle of a scroll.
             backing->asset.use_banner = true;
-            gm_load_save_icon(backing);
+            if (gm_cards != NULL) {
+                int region = gm_card_region(backing->extra.game_id);
+                gm_card_open(&gm_cards[region], region);
+                gm_path_release();
+            }
 
             // bool icon_loaded = gm_load_icon(backing, aram_offset, force_unload);
             // if (!icon_loaded) {
@@ -1600,21 +1769,9 @@ void gm_check_files(int path_count) {
         game_backing_count = gm_entry_count;
     }
 
-    // Second pass: animation frames for the icons that animate, top of the folder first,
-    // into whatever room the icon pool has left after every still is in.
-    for (int i = 0; i < gm_entry_count && !gm_scan_stopped; i++) {
-        if (!OSTryLockMutex(game_enum_mutex)) {
-            gm_scan_stopped = true;
-            break;
-        }
-        OSUnlockMutex(game_enum_mutex);
-
-        gm_file_entry_t *entry = gm_entry_backing[i];
-        if (entry->type == GM_FILE_TYPE_GAME)
-            gm_load_save_icon_anim(entry);
-    }
-
-    gm_save_icons_end();
+    // The card directories and the .gci list stay loaded for as long as this folder is
+    // shown (the next scan frees them), and the menu loads the icons for the rows on screen.
+    gm_icons_mark_dirty();
 
     OSReport("Total entries = %d\n", gm_entry_count);
 
@@ -1690,6 +1847,7 @@ void gm_line_free(int line_num) {
 
 void gm_line_changed(int delta) {
     // OSReport("Line changed %+d\n", delta);
+    gm_icons_mark_dirty(); // save icons follow the rows on screen (gm_icons_tick)
 
     // int previous_line_num = top_line_num;
     int new_line_num = top_line_num + delta;
@@ -1979,6 +2137,7 @@ void gm_apply_pending_last_played() {
     if (slot >= gm_entry_count) return;
 
     grid_jump_to_slot(slot);
+    gm_icons_mark_dirty();
 }
 
 #if 0
