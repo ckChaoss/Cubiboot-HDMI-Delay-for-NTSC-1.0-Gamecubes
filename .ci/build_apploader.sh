@@ -35,6 +35,20 @@ echo "$SWISS_COMMIT" > "$REPO/apploader.swiss-commit"
 mkdir -p "$WORK/swiss-gc/cube/swiss"
 cp "$REPO/cubeboot/cubeboot.elf" "$WORK/swiss-gc/cube/swiss/swiss.elf"
 
+# 2b) mark this copy as the In-Game Reset one: the loader skips the boot animation when it
+# finds the marker set (config.ini igr_skip_intro). Exactly one occurrence, or stop.
+python3 - "$WORK/swiss-gc/cube/swiss/swiss.elf" <<'PY'
+import sys
+p = sys.argv[1]
+d = open(p, "rb").read()
+old, new = b"CUBIBOOT-IGR-COPY:0", b"CUBIBOOT-IGR-COPY:1"
+n = d.count(old)
+if n != 1:
+    sys.exit("ERROR: expected one IGR marker in cubeboot.elf, found %d" % n)
+open(p, "wb").write(d.replace(old, new))
+print(">> marked the apploader.img loader as the In-Game Reset copy")
+PY
+
 # 3) packer compresses with 7z by default; swap to xz + PPC BCJ (decoder is generic)
 cd "$WORK/swiss-gc/cube/packer"
 sed -i 's#.*7z a .*#\t$(SILENTCMD)xz -k -c -F xz --powerpc --lzma2=preset=9e --check=crc32 $< > $@#' Makefile
