@@ -182,6 +182,18 @@ void load_settings() {
     }
 
     // postboot delay
+    // In-game reset back to the menu: skip the boot animation (igr_skip_intro), with its own
+    // black hold before the menu (igr_delay_ms; the preboot delay when absent -- a game in
+    // 480p resetting to the 480i menu makes the HDMI adapter lock on again).
+    settings.igr_skip_intro = ini_get_bool(conf, "igr_skip_intro", 1);
+    u32 igr_delay_ms = 0;
+    if (!ini_sget(conf, "cubeboot", "igr_delay_ms", "%u", &igr_delay_ms)) {
+        settings.igr_delay_ms = settings.preboot_delay_ms;
+    } else {
+        iprintf("Found igr_delay_ms = %u\n", igr_delay_ms);
+        settings.igr_delay_ms = igr_delay_ms;
+    }
+
     u32 postboot_delay_ms = 0;
     if (!ini_sget(conf, "cubeboot", "postboot_delay_ms", "%u", &postboot_delay_ms)) {
         settings.postboot_delay_ms = 0;
