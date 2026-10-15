@@ -975,8 +975,8 @@ static int gm_card_region(const u8 *game_id) {
 
 // One open/read/close per call: the SD file layer keeps a single open file, and the
 // game scan around us opens other files in between.
-static bool gm_card_read(gm_card_t *card, u32 offset, u32 len, void *dst) {
-    if (dvd_custom_open(card->path, FILE_ENTRY_TYPE_FILE, IPC_FILE_FLAG_DISABLECACHE) != 0)
+static bool gm_path_read(const char *path, u32 offset, u32 len, void *dst) {
+    if (dvd_custom_open((char *)path, FILE_ENTRY_TYPE_FILE, IPC_FILE_FLAG_DISABLECACHE) != 0)
         return false;
     file_status_t *status = dvd_custom_status();
     if (status == NULL || status->result != 0)
@@ -984,6 +984,10 @@ static bool gm_card_read(gm_card_t *card, u32 offset, u32 len, void *dst) {
     int r = dvd_read_data(dst, len, offset, status->fd);
     dvd_custom_close(status->fd);
     return r == 0;
+}
+
+static bool gm_card_read(gm_card_t *card, u32 offset, u32 len, void *dst) {
+    return gm_path_read(card->path, offset, len, dst);
 }
 
 static inline u16 gm_be16(const u8 *p) { return (u16)((p[0] << 8) | p[1]); }
@@ -1130,17 +1134,135 @@ static bool gm_icon_layout(const gm_card_dirent_t *de, gm_icon_layout_t *lo) {
     return lo->count > 0;
 }
 
+static const gm_card_dirent_t *gm_find_save(gm_card_t *card, const u8 *game_id);
+
+// Where a game's save comes from: inside the card image (spread over blocks, through the
+// block map), or a .gci file in GM_GCI_DIR (a 64-byte header -- the same directory entry
+// the card keeps -- then the save's data in one piece).
+typedef struct {
+    gm_card_t *card;               // card image source, or NULL
+    const char *gci_name;          // .gci source (name inside GM_GCI_DIR), or NULL
+    const gm_card_dirent_t *de;    // the save's directory entry / .gci header
+} gm_save_src_t;
+
+#define GM_GCI_DIR     "/swiss/icons/"
+#define GM_GCI_MAX     600          // .gci files indexed per folder scan
+#define GM_GCI_NAME    96           // longest file name kept (longer ones are skipped)
+#define GM_GCI_HEADER  0x40
+
+typedef struct {
+    gm_card_dirent_t hdr;           // the file's header, big-endian like the card's
+    char name[GM_GCI_NAME];
+} gm_gci_t;
+
+// Built by gm_save_icons_begin from the games heap, freed by gm_save_icons_end.
+static gm_gci_t *gm_gcis = NULL;
+static int gm_gci_count = 0;
+
+static bool gm_src_read(const gm_save_src_t *src, u32 offset, u32 len, u8 *dst) {
+    if (src->gci_name != NULL) {
+        char path[sizeof(GM_GCI_DIR) + GM_GCI_NAME];
+        strcpy(path, GM_GCI_DIR);
+        strcat(path, src->gci_name);
+        return gm_path_read(path, GM_GCI_HEADER + offset, len, dst);
+    }
+    return gm_card_read_file(src->card, src->de, offset, len, dst);
+}
+
+static bool gm_has_icon(const gm_card_dirent_t *d) {
+    return d->gamecode[0] != 0xFF && d->icon_addr != 0xFFFFFFFF && (d->icon_fmt & 3) != GM_ICON_NONE;
+}
+
+// Every .gci in GM_GCI_DIR: names first (the directory handle is the only one open while
+// listing), then each file's header. Files that are too short or carry no icon are dropped.
+static void gm_gci_index_build(void) {
+    gm_gcis = NULL;
+    gm_gci_count = 0;
+
+    if (dvd_custom_open(GM_GCI_DIR, FILE_ENTRY_TYPE_DIR, 0) != 0) return; // no folder: fine
+    file_status_t *status = dvd_custom_status();
+    if (status == NULL || status->result != 0) return;
+    u8 dir_fd = status->fd;
+
+    gm_gcis = gm_malloc(sizeof(gm_gci_t) * GM_GCI_MAX);
+    file_entry_t *ent = gm_malloc(sizeof(file_entry_t));
+    if (gm_gcis == NULL || ent == NULL) {
+        dvd_custom_close(dir_fd);
+        if (ent) gm_free(ent);
+        if (gm_gcis) gm_free(gm_gcis);
+        gm_gcis = NULL;
+        return;
+    }
+
+    int n = 0;
+    while (n < GM_GCI_MAX) {
+        if (dvd_custom_readdir(ent, dir_fd) != 0) break;
+        if (ent->name[0] == 0) break; // end of directory
+        if (ent->type != FILE_ENTRY_TYPE_FILE) continue;
+        int len = strlen(ent->name);
+        if (len < 5 || len >= GM_GCI_NAME) continue;
+        if (strcasecmp(ent->name + len - 4, ".gci") != 0) continue;
+        strcpy(gm_gcis[n].name, ent->name);
+        n++;
+    }
+    dvd_custom_close(dir_fd);
+    gm_free(ent);
+
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        char path[sizeof(GM_GCI_DIR) + GM_GCI_NAME];
+        strcpy(path, GM_GCI_DIR);
+        strcat(path, gm_gcis[i].name);
+        gm_card_dirent_t hdr;
+        if (!gm_path_read(path, 0, GM_GCI_HEADER, &hdr)) continue;
+        if (!gm_has_icon(&hdr)) continue;
+        if (kept != i) strcpy(gm_gcis[kept].name, gm_gcis[i].name);
+        gm_gcis[kept].hdr = hdr;
+        kept++;
+    }
+    gm_gci_count = kept;
+    OSReport("Save icons: %d .gci file(s) with icons in %s\n", kept, GM_GCI_DIR);
+}
+
+// Card A first (the save that is in use), then the .gci folder.
+static bool gm_find_source(const u8 *game_id, gm_save_src_t *src) {
+    src->card = NULL;
+    src->gci_name = NULL;
+    src->de = NULL;
+
+    int region = gm_card_region(game_id);
+    gm_card_t *card = &gm_cards[region];
+    if (gm_card_open(card, region)) {
+        const gm_card_dirent_t *de = gm_find_save(card, game_id);
+        if (de != NULL) {
+            src->card = card;
+            src->de = de;
+            return true;
+        }
+    }
+
+    for (int i = 0; i < gm_gci_count; i++) {
+        const gm_card_dirent_t *d = &gm_gcis[i].hdr;
+        if (memcmp(d->gamecode, game_id, 4) != 0) continue;
+        if (memcmp(d->company, &game_id[4], 2) != 0) continue;
+        src->gci_name = gm_gcis[i].name;
+        src->de = d;
+        return true;
+    }
+    return false;
+}
+
 // Reads frame `f` (which must have a pixel format) as 32x32 RGB5A3 into `out`.
-static bool gm_read_icon_frame(gm_card_t *card, const gm_card_dirent_t *de, const gm_icon_layout_t *lo, int f, u8 *out) {
+static bool gm_read_icon_frame(const gm_save_src_t *src, const gm_icon_layout_t *lo, int f, u8 *out) {
     u8 *raw = gm_icon_scratch;
     switch (lo->fmt[f]) {
         case GM_ICON_RGB5A3:
-            return gm_card_read_file(card, de, lo->offset[f], 0x800, out);
+            return gm_src_read(src, lo->offset[f], 0x800, out);
         case GM_ICON_CI8:
         case GM_ICON_CI8_SHARE: {
             u32 pal_at = lo->fmt[f] == GM_ICON_CI8 ? lo->offset[f] + 0x400 : lo->shared_palette;
-            if (!gm_card_read_file(card, de, lo->offset[f], 0x400, raw)) return false;
-            if (!gm_card_read_file(card, de, pal_at, 0x200, raw + 0x400)) return false;
+            if (!gm_src_read(src, lo->offset[f], 0x400, raw)) return false;
+            if (!gm_src_read(src, pal_at, 0x200, raw + 0x400)) return false;
             gm_icon_ci8_to_rgb5a3(raw, raw + 0x400, out);
             return true;
         }
@@ -1200,20 +1322,16 @@ const u8 *gm_icon_frame_data(gm_icon_buf_t *first, u32 tick) {
 static void gm_load_save_icon(gm_file_entry_t *entry) {
     if (gm_cards == NULL || gm_icon_scratch == NULL) return;
 
-    int region = gm_card_region(entry->extra.game_id);
-    gm_card_t *card = &gm_cards[region];
-    if (!gm_card_open(card, region)) return;
-
-    const gm_card_dirent_t *de = gm_find_save(card, entry->extra.game_id);
-    if (de == NULL) return;
+    gm_save_src_t src;
+    if (!gm_find_source(entry->extra.game_id, &src)) return;
 
     gm_icon_layout_t lo;
-    if (!gm_icon_layout(de, &lo)) return;
+    if (!gm_icon_layout(src.de, &lo)) return;
 
     gm_icon_buf_t *slot = gm_get_icon_buf();
     if (slot == NULL) return; // pool full: this one keeps its banner
 
-    if (!gm_read_icon_frame(card, de, &lo, 0, slot->data)) {
+    if (!gm_read_icon_frame(&src, &lo, 0, slot->data)) {
         gm_free_icon_buf(slot);
         return;
     }
@@ -1235,15 +1353,11 @@ static void gm_load_save_icon_anim(gm_file_entry_t *entry) {
     if (gm_cards == NULL || gm_icon_scratch == NULL) return;
     if (entry->asset.icon.state != GM_LOAD_STATE_LOADED || entry->asset.icon.buf == NULL) return;
 
-    int region = gm_card_region(entry->extra.game_id);
-    gm_card_t *card = &gm_cards[region];
-    if (!card->ok) return;
-
-    const gm_card_dirent_t *de = gm_find_save(card, entry->extra.game_id);
-    if (de == NULL) return;
+    gm_save_src_t src;
+    if (!gm_find_source(entry->extra.game_id, &src)) return;
 
     gm_icon_layout_t lo;
-    if (!gm_icon_layout(de, &lo) || lo.count <= 1) return;
+    if (!gm_icon_layout(src.de, &lo) || lo.count <= 1) return;
 
     gm_icon_buf_t *first = entry->asset.icon.buf;
     gm_icon_buf_t *taken[8] = { 0 };
@@ -1254,7 +1368,7 @@ static void gm_load_save_icon_anim(gm_file_entry_t *entry) {
     for (int f = 1; f < lo.count; f++) {
         if (lo.fmt[f] == GM_ICON_NONE) continue;
         gm_icon_buf_t *slot = gm_get_icon_buf();
-        if (slot == NULL || !gm_read_icon_frame(card, de, &lo, f, slot->data)) {
+        if (slot == NULL || !gm_read_icon_frame(&src, &lo, f, slot->data)) {
             if (slot != NULL) gm_free_icon_buf(slot);
             for (int k = 1; k < f; k++) if (taken[k]) gm_free_icon_buf(taken[k]);
             return;
@@ -1307,6 +1421,7 @@ static void gm_save_icons_begin(void) {
         return;
     }
     memset(gm_cards, 0, sizeof(gm_card_t) * 3);
+    gm_gci_index_build();
 }
 
 static void gm_save_icons_end(void) {
@@ -1318,8 +1433,11 @@ static void gm_save_icons_end(void) {
         gm_free(gm_cards);
     }
     if (gm_icon_scratch != NULL) gm_free(gm_icon_scratch);
+    if (gm_gcis != NULL) gm_free(gm_gcis);
     gm_cards = NULL;
     gm_icon_scratch = NULL;
+    gm_gcis = NULL;
+    gm_gci_count = 0;
 }
 
 void gm_check_files(int path_count) {
