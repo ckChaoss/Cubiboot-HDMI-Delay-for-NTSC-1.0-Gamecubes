@@ -159,9 +159,7 @@ static bool bnr_cache_load(BNR* bnr, u32 aram_offset) {
     return true;
 }
 
-// 512 banners: the cache fills ARAM down from 16 MiB to just under 12 MiB. The save icon
-// preload (patches/source/games.c, GM_PRE_ARAM_TOP) sits right below, so keep the two in step.
-#define BNR_CACHE_SIZE 512
+#define BNR_CACHE_SIZE 1024
 
 typedef struct {
     u32 key; // bnr_cache_key(path)
