@@ -331,6 +331,7 @@ int main(int argc, char **argv) {
     set_patch_value(symshdr, syment, symstringdata, "remember_last_game", settings.remember_last_game);
     set_patch_value(symshdr, syment, symstringdata, "pin_swiss", settings.pin_swiss);
     set_patch_value(symshdr, syment, symstringdata, "save_icons", settings.save_icons);
+    set_patch_value(symshdr, syment, symstringdata, "icon_preload", settings.icon_preload);
     set_patch_value(symshdr, syment, symstringdata, "show_watermark", settings.show_watermark);
 
     // Back from an in-game reset: straight to the game list instead of the boot animation,
