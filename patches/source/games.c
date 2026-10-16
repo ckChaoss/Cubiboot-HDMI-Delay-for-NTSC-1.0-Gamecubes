@@ -1180,8 +1180,6 @@ typedef struct {
     const gm_card_dirent_t *de;    // the save's directory entry / .gci header
 } gm_save_src_t;
 
-static void gm_pre_store_src(const gm_save_src_t *src); // icon preload, below
-
 #define GM_GCI_DIR     "/swiss/icons/"
 #define GM_GCI_MAX     600          // .gci files indexed per folder scan
 #define GM_GCI_NAME    96           // longest file name kept (longer ones are skipped)
@@ -1256,10 +1254,6 @@ static void gm_gci_index_build(void) {
         if (!gm_has_icon(&hdr)) continue;
         if (kept != i) strcpy(gm_gcis[kept].name, gm_gcis[i].name);
         gm_gcis[kept].hdr = hdr;
-        // Icon preload: this file is still open from the header read, so its frames
-        // cost no extra file open.
-        gm_save_src_t src = { NULL, gm_gcis[kept].name, &gm_gcis[kept].hdr };
-        gm_pre_store_src(&src);
         kept++;
     }
     gm_path_release();
@@ -1315,27 +1309,35 @@ static bool gm_read_icon_frame_sd(const gm_save_src_t *src, const gm_icon_layout
 }
 
 // ---------------------------------------------------------------------------------------
-// Icon preload (icon_preload, on by default). While the folder is scanned -- behind the
-// boot animation -- every save icon frame is converted once and copied into ARAM, the
-// GameCube's 16 MiB audio memory, which the menu barely uses. Scrolling then fetches icons
-// with a short ARAM->RAM copy instead of finding and reading files on the SD card.
+// Icon preload (icon_preload, on by default). Once the menu is up and the list sits still,
+// every save icon frame of the folder's games is converted once and copied into ARAM, the
+// GameCube's 16 MiB audio memory, one save per frame (gm_pre_tick, menu thread). Scrolling
+// then fetches icons with a short ARAM->RAM copy instead of finding and reading files on
+// the SD card.
 //
-// Where: frames are stacked downward from the 8 MiB mark, one 2 KiB frame each, at most
-// GM_PRE_FRAMES (down to 4 MiB). Above sits the banner cache (tweaks.c, which fills down
-// from 16 MiB and never goes below 8 MiB); below, the IPL's own sound data.
+// When: never during the boot or the scan. A first version copied from the scan's very
+// start and an NTSC 1.0 console never showed a picture -- most likely the copies ran before
+// the BIOS had its ARAM/audio side set up. From the menu, the BIOS is long done with that,
+// and the menu thread already owns every SD read after the scan, so nothing runs alongside.
+//
+// Where: right below the banner cache, the part of ARAM this console already uses without
+// trouble. The banner cache (tweaks.c) fills down from 16 MiB, at most BNR_CACHE_SIZE (512)
+// banners -- to just under 12 MiB; the frames stack downward from 11.5 MiB, one 2 KiB frame
+// each, at most GM_PRE_FRAMES (to 8.5 MiB).
 //
 // Safety: nothing is trusted blindly. Every frame keeps a checksum in RAM, and each copy
 // back is checked against it; a mismatch, or a copy that does not finish in time, switches
 // the preload off and the icon is read from the SD card instead, exactly as without it.
 // The copies use the same bounded-wait ARQ pattern as the banner cache (tweaks.c), which
 // already runs on this console. The only memory used is the games heap (two small tables)
-// and one icon pool slot as the staging buffer during the scan -- nothing new in lowmem.
+// and one icon pool slot borrowed for each copy -- nothing new in lowmem.
 // ---------------------------------------------------------------------------------------
 extern u32 icon_preload;
 
 #define GM_PRE_FRAME_LEN     0x800                // one 32x32 RGB5A3 frame
-#define GM_PRE_ARAM_TOP      (8 * 1024 * 1024)    // frames stack downward from here
-#define GM_PRE_FRAMES        2048                 // 4 MiB: down to the 4 MiB mark
+#define GM_PRE_ARAM_TOP      0xB80000             // 11.5 MiB; frames stack downward from here
+#define GM_PRE_FRAMES        1536                 // 3 MiB: down to the 8.5 MiB mark
+#define GM_PRE_IDLE_FRAMES   30                   // list still this long (1/2 s) before copying
 #define GM_PRE_MAX_SAVES     1024
 #define GM_PRE_DMA_TIMEOUT_US (500 * 1000)
 
@@ -1351,7 +1353,8 @@ static u32 *gm_pre_sums = NULL;            // one checksum per frame, games heap
 static int gm_pre_next = 0;                // next free frame
 static bool gm_pre_on = false;             // usable for this folder
 static bool gm_pre_dead = false;           // a copy timed out: off for the session
-static gm_icon_buf_t *gm_pre_stage = NULL; // staging buffer while preloading (a pool slot)
+static int gm_pre_cursor = 0;              // next game of the folder to preload
+static int gm_pre_idle = 0;                // frames the list has been still
 
 static inline u32 gm_pre_aram(int k) {
     return GM_PRE_ARAM_TOP - (u32)(k + 1) * GM_PRE_FRAME_LEN;
@@ -1408,9 +1411,10 @@ static const gm_pre_save_t *gm_pre_find(const gm_card_dirent_t *de) {
     return NULL;
 }
 
-// Every frame with a picture of this save, converted and copied into ARAM.
-static void gm_pre_store_src(const gm_save_src_t *src) {
-    if (!gm_pre_on || gm_pre_stage == NULL || gm_icon_scratch == NULL) return;
+// Every frame with a picture of this save, converted and copied into ARAM through `stage`
+// (a 32-byte aligned 2 KiB buffer).
+static void gm_pre_store_src(const gm_save_src_t *src, u8 *stage) {
+    if (!gm_pre_on || gm_icon_scratch == NULL) return;
     if (gm_pre_save_count >= GM_PRE_MAX_SAVES) return;
     if (gm_pre_find(src->de) != NULL) return;
 
@@ -1424,9 +1428,9 @@ static void gm_pre_store_src(const gm_save_src_t *src) {
     int k = gm_pre_next;
     for (int f = 0; f < lo.count; f++) {
         if (lo.fmt[f] == GM_ICON_NONE) continue;
-        if (!gm_read_icon_frame_sd(src, &lo, f, gm_pre_stage->data)) return; // unreadable: SD later
-        gm_pre_sums[k] = gm_pre_checksum(gm_pre_stage->data);
-        if (!gm_pre_dma(true, gm_pre_stage->data, gm_pre_aram(k))) return;
+        if (!gm_read_icon_frame_sd(src, &lo, f, stage)) return; // unreadable: SD later
+        gm_pre_sums[k] = gm_pre_checksum(stage);
+        if (!gm_pre_dma(true, stage, gm_pre_aram(k))) return;
         k++;
     }
 
@@ -1463,33 +1467,51 @@ static void gm_pre_begin(void) {
     gm_pre_on = false;
     gm_pre_next = 0;
     gm_pre_save_count = 0;
+    gm_pre_cursor = 0;
+    gm_pre_idle = 0;
     if (!icon_preload || gm_pre_dead) return;
 
     gm_pre_saves = gm_malloc(sizeof(gm_pre_save_t) * GM_PRE_MAX_SAVES);
     gm_pre_sums = gm_malloc(sizeof(u32) * GM_PRE_FRAMES);
-    gm_pre_stage = gm_get_icon_buf();
-    if (gm_pre_saves == NULL || gm_pre_sums == NULL || gm_pre_stage == NULL) {
+    if (gm_pre_saves == NULL || gm_pre_sums == NULL) {
         if (gm_pre_saves) gm_free(gm_pre_saves);
         if (gm_pre_sums) gm_free(gm_pre_sums);
-        if (gm_pre_stage) gm_free_icon_buf(gm_pre_stage);
         gm_pre_saves = NULL;
         gm_pre_sums = NULL;
-        gm_pre_stage = NULL;
         return;
     }
     gm_pre_on = true;
 }
 
-// The staging slot goes back to the pool once the scan has stored everything.
-static void gm_pre_stage_done(void) {
-    if (gm_pre_stage != NULL) gm_free_icon_buf(gm_pre_stage);
-    gm_pre_stage = NULL;
-    if (gm_pre_on)
-        OSReport("Icon preload: %d save(s), %d frame(s) in ARAM\n", gm_pre_save_count, gm_pre_next);
+// Menu thread, from gm_icons_tick, only while the list sits still and nothing else is
+// loading: one save of the folder per call, so a frame never carries more than one save's
+// reads. Scrolling resets the wait (gm_pre_note_scroll); until a save is in ARAM, its icon
+// is read from the SD card as before.
+static void gm_pre_tick(void) {
+    if (!gm_pre_on || gm_pre_cursor >= gm_entry_count) return;
+    if (++gm_pre_idle < GM_PRE_IDLE_FRAMES) return;
+
+    while (gm_pre_cursor < gm_entry_count) {
+        gm_file_entry_t *e = gm_entry_backing[gm_pre_cursor];
+        gm_save_src_t src;
+        if (e->type != GM_FILE_TYPE_GAME || !gm_find_source(e->extra.game_id, &src) ||
+            gm_pre_find(src.de) != NULL) {
+            gm_pre_cursor++; // nothing to copy for this one: a lookup only, keep going
+            continue;
+        }
+        gm_icon_buf_t *stage = gm_get_icon_buf();
+        if (stage == NULL) return; // pool busy: next frame
+        gm_pre_store_src(&src, stage->data);
+        gm_free_icon_buf(stage);
+        gm_path_release(); // nothing stays open once the menu carries on
+        gm_pre_cursor++;
+        if (gm_pre_cursor >= gm_entry_count)
+            OSReport("Icon preload: %d save(s), %d frame(s) in ARAM\n", gm_pre_save_count, gm_pre_next);
+        return; // one save per frame
+    }
 }
 
 static void gm_pre_end(void) {
-    gm_pre_stage_done();
     gm_pre_on = false;
     if (gm_pre_saves) gm_free(gm_pre_saves);
     if (gm_pre_sums) gm_free(gm_pre_sums);
@@ -1799,12 +1821,17 @@ void gm_icons_tick(void) {
         gm_icons_update_window(false);
         gm_icons_anim_pending = true;
         gm_icons_quiet_frames = 0;
+        gm_pre_idle = 0;
         return;
     }
-    if (gm_icons_anim_pending && ++gm_icons_quiet_frames >= GM_ANIM_SETTLE_FRAMES) {
-        gm_icons_anim_pending = false;
-        gm_icons_update_window(true); // everything is in place: only the animations load
+    if (gm_icons_anim_pending) {
+        if (++gm_icons_quiet_frames >= GM_ANIM_SETTLE_FRAMES) {
+            gm_icons_anim_pending = false;
+            gm_icons_update_window(true); // everything is in place: only the animations load
+        }
+        return;
     }
+    gm_pre_tick(); // the list is still and its icons are in: copy the next save into ARAM
 }
 
 static void gm_save_icons_end(void);
@@ -1825,8 +1852,8 @@ static void gm_save_icons_begin(void) {
         return;
     }
     memset(gm_cards, 0, sizeof(gm_card_t) * 3);
-    gm_pre_begin();       // before the .gci index: it preloads while each file is open
     gm_gci_index_build();
+    gm_pre_begin();       // tables only: the copying happens later, from the menu (gm_pre_tick)
 }
 
 static void gm_save_icons_end(void) {
@@ -1960,11 +1987,6 @@ void gm_check_files(int path_count) {
             if (gm_cards != NULL) {
                 int region = gm_card_region(backing->extra.game_id);
                 gm_card_open(&gm_cards[region], region);
-                if (gm_pre_on) { // card saves: the .gci ones were preloaded with the index
-                    gm_save_src_t ps;
-                    if (gm_find_source(backing->extra.game_id, &ps) && ps.card != NULL)
-                        gm_pre_store_src(&ps);
-                }
                 if (!gm_scan_is_last_played &&
                     gm_entry_count < (DRAW_TOTAL_ROWS + GM_ICON_MARGIN_ROWS) * columns_per_line)
                     gm_load_save_icon(backing);
@@ -2054,8 +2076,6 @@ void gm_check_files(int path_count) {
         if (gm_entry_count == (DRAW_TOTAL_ROWS + GM_ICON_MARGIN_ROWS) * columns_per_line)
             gm_load_first_screen_anim();
     }
-
-    gm_pre_stage_done(); // everything is stored: its staging slot goes back to the pool
 
     // The first screen's animations: normally started mid-scan (see the loop above); this
     // catches a folder too small to fill a screen.
