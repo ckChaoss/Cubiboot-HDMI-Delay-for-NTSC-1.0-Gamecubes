@@ -1508,6 +1508,20 @@ static void gm_save_icon_strip_anim(gm_file_entry_t *entry) {
 // scrolls in; only on-screen rows animate, so the whole pool goes to what you can see.
 #define GM_ICON_MARGIN_ROWS 1
 
+// True when this game will show a save icon instead of its banner on the cube. In the
+// sliding window (>127 games) such a game skips its banner read while scrolling -- the cube
+// never shows it -- and the banner (picture plus company/description for the info box) is
+// read only once the cursor rests on the game (gm_selected_banner_tick). Lookup only: the
+// card directories and the .gci list are already in memory.
+static bool gm_banner_skippable(gm_file_entry_t *e) {
+    if (!gm_evict_on_scroll || !save_icons || gm_cards == NULL || gm_icon_scratch == NULL) return false;
+    if (e->type != GM_FILE_TYPE_GAME) return false;
+    gm_save_src_t src;
+    if (!gm_find_source(e->extra.game_id, &src)) return false;
+    gm_icon_layout_t lo;
+    return gm_icon_layout(src.de, &lo);
+}
+
 static void gm_icons_update_window(void) {
     int cols = columns_per_line;
     int vis_lo = top_line_num * cols;
@@ -1531,6 +1545,19 @@ static void gm_icons_update_window(void) {
         gm_file_entry_t *e = gm_entry_backing[i];
         if (e->type == GM_FILE_TYPE_GAME && e->asset.icon.state == GM_LOAD_STATE_NONE)
             gm_load_save_icon(e);
+    }
+
+    // 2b. A game on screen whose icon could not load (pool full, unreadable save) and whose
+    // banner was skipped gets its banner after all, so no cube is left empty.
+    if (gm_evict_on_scroll) {
+        for (int i = vis_lo; i < vis_hi; i++) {
+            gm_file_entry_t *e = gm_entry_backing[i];
+            if (e->type != GM_FILE_TYPE_GAME) continue;
+            if (e->asset.icon.state == GM_LOAD_STATE_LOADED) continue;
+            if (e->asset.banner.state == GM_LOAD_STATE_LOADED) continue;
+            gm_path_release(); // gm_load_banner opens its own file
+            gm_load_banner(e, 0, false, false);
+        }
     }
 
     // 3. The margin rows keep only their stills.
@@ -1862,7 +1889,9 @@ void gm_line_load(int line_num) {
             if (gm_evict_on_scroll) {
                 // sliding window (>128): re-read from disc, no bnr_cache => no ARAM.
                 // gm_load_banner guards against re-loading an already-resident banner.
-                gm_load_banner(entry, 0, false, false);
+                // A game showing a save icon skips it (gm_banner_skippable).
+                if (!gm_banner_skippable(entry))
+                    gm_load_banner(entry, 0, false, false);
             } else {
                 gm_banner_load(&entry->asset.banner); // no-op: <=128 stays resident
             }
@@ -1940,6 +1969,33 @@ void gm_line_changed(int delta) {
 }
 
 // so grid can check if load/unload is possible
+// The selected game's banner, for the info box, when the scroll skipped it. Waits until the
+// cursor has rested on the game for a few frames, so holding the stick down never reads.
+#define GM_SELECTED_BANNER_DELAY 10 // frames (1/6 s)
+
+void gm_selected_banner_tick(int slot) {
+    static int last_slot = -2;
+    static int still_frames = 0;
+    if (slot != last_slot) {
+        last_slot = slot;
+        still_frames = 0;
+        return;
+    }
+    if (still_frames > GM_SELECTED_BANNER_DELAY) return; // already handled
+    if (++still_frames <= GM_SELECTED_BANNER_DELAY) return;
+
+    if (!gm_evict_on_scroll || gm_scan_in_progress || game_enum_running) {
+        still_frames = 0; // try again once the scan is done
+        return;
+    }
+    if (slot < 0 || slot >= gm_entry_count) return;
+    gm_file_entry_t *e = gm_entry_backing[slot];
+    if (e->type != GM_FILE_TYPE_GAME) return;
+    if (e->asset.banner.state == GM_LOAD_STATE_LOADED) return;
+    gm_path_release(); // gm_load_banner opens its own file
+    gm_load_banner(e, 0, false, false);
+}
+
 bool gm_can_move() {
     return !gm_scan_in_progress; // see gm_scan_in_progress
 }
