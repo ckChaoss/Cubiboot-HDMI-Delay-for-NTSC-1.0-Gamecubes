@@ -1604,6 +1604,25 @@ static void gm_save_icons_end(void) {
     gm_gci_count = 0;
 }
 
+// The first screen's animations, once every still on it (and on the row below) is in --
+// stills first, so a full pool never costs a game its icon. Done as soon as those entries
+// exist rather than at the end of the scan: after an In-Game Reset the menu is already up
+// while the rest of a big folder is still being scanned.
+static bool gm_first_screen_anim_done = false;
+
+static void gm_load_first_screen_anim(void) {
+    if (gm_first_screen_anim_done) return;
+    gm_first_screen_anim_done = true;
+    if (gm_cards == NULL || gm_scan_is_last_played || gm_scan_stopped) return;
+
+    int first_screen = DRAW_TOTAL_ROWS * columns_per_line;
+    for (int i = 0; i < gm_entry_count && i < first_screen; i++) {
+        gm_file_entry_t *entry = gm_entry_backing[i];
+        if (entry->type == GM_FILE_TYPE_GAME) gm_load_save_icon_anim(entry);
+    }
+    gm_path_release(); // the scan opens other files next
+}
+
 void gm_check_files(int path_count) {
     // Here we will also check for override assets and matching save icons
     u32 aram_offset = (1 * 1024 * 1024); // 1MB mark
@@ -1614,6 +1633,7 @@ void gm_check_files(int path_count) {
     char app_dol_path[GM_PATH_MAX];
 
     gm_save_icons_begin();
+    gm_first_screen_anim_done = false;
 
     // Enumerate all of the games
     u64 start_time = gettime();
@@ -1774,19 +1794,15 @@ void gm_check_files(int path_count) {
 
         // udelay_threaded(100 * 1000); // test only
         game_backing_count = gm_entry_count;
+
+        // First screen and the row below it complete: start their animations now.
+        if (gm_entry_count == (DRAW_TOTAL_ROWS + GM_ICON_MARGIN_ROWS) * columns_per_line)
+            gm_load_first_screen_anim();
     }
 
-    // The first screen's animations too, once every still on it is in (stills come first so
-    // a full pool never costs a game its icon). Still before the scan ends, so the menu shows
-    // the first screen complete.
-    if (gm_cards != NULL && !gm_scan_is_last_played && !gm_scan_stopped) {
-        int first_screen = DRAW_TOTAL_ROWS * columns_per_line;
-        for (int i = 0; i < gm_entry_count && i < first_screen; i++) {
-            gm_file_entry_t *entry = gm_entry_backing[i];
-            if (entry->type == GM_FILE_TYPE_GAME) gm_load_save_icon_anim(entry);
-        }
-        gm_path_release();
-    }
+    // The first screen's animations: normally started mid-scan (see the loop above); this
+    // catches a folder too small to fill a screen.
+    gm_load_first_screen_anim();
 
     // The card directories and the .gci list stay loaded for as long as this folder is
     // shown (the next scan frees them), and the menu loads the icons for the rows on screen.
