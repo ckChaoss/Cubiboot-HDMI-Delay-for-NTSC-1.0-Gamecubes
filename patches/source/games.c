@@ -1354,6 +1354,7 @@ static int gm_pre_next = 0;                // next free frame
 static bool gm_pre_on = false;             // usable for this folder
 static bool gm_pre_dead = false;           // a copy timed out: off for the session
 static int gm_pre_cursor = 0;              // next game of the folder to preload
+static int gm_bnr_cursor = 0;              // next game whose banner goes into the cache
 static int gm_pre_idle = 0;                // frames the list has been still
 
 static inline u32 gm_pre_aram(int k) {
@@ -1469,6 +1470,7 @@ static void gm_pre_begin(void) {
     gm_pre_save_count = 0;
     gm_pre_cursor = 0;
     gm_pre_idle = 0;
+    gm_bnr_cursor = 0;
     if (!icon_preload || gm_pre_dead) return;
 
     gm_pre_saves = gm_malloc(sizeof(gm_pre_save_t) * GM_PRE_MAX_SAVES);
@@ -1487,8 +1489,42 @@ static void gm_pre_begin(void) {
 // loading: one save of the folder per call, so a frame never carries more than one save's
 // reads. Scrolling resets the wait (gm_pre_note_scroll); until a save is in ARAM, its icon
 // is read from the SD card as before.
+// Banners go in after the icons: each game's banner into the ARAM banner cache (tweaks.c,
+// the same one the scan fills for the first 127), so scrolling a big folder reads banners
+// from there instead of the card too. Only for folders that fit the cache (512 banners).
+#define GM_PRE_BANNER_MAX 500
+
+static void gm_pre_banner_step(void) {
+    if (!gm_evict_on_scroll || gm_entry_count > GM_PRE_BANNER_MAX) {
+        gm_bnr_cursor = gm_entry_count; // nothing to do for this folder
+        return;
+    }
+    // The banner window exactly as gm_line_changed keeps it, so nothing outside it holds a slot.
+    int lo_line = top_line_num - PRELOAD_LINE_COUNT + 1;
+    int hi_line = top_line_num + DRAW_TOTAL_ROWS + PRELOAD_LINE_COUNT - 1;
+    while (gm_bnr_cursor < gm_entry_count) {
+        int index = gm_bnr_cursor++;
+        gm_file_entry_t *e = gm_entry_backing[index];
+        if (e->type != GM_FILE_TYPE_GAME) continue;
+        if (e->asset.banner.state == GM_LOAD_STATE_LOADED) continue; // loaded = cached already
+        gm_path_release(); // gm_load_banner opens its own file
+        if (gm_load_banner(e, 0, false, true)) {
+            // Only the cache copy was wanted: a line off the window gives its slot back.
+            int line = index / columns_per_line;
+            if (line < lo_line || line > hi_line) gm_banner_free(&e->asset.banner);
+        }
+        if (gm_bnr_cursor >= gm_entry_count) OSReport("Banner preload: done\n");
+        return; // one banner per frame
+    }
+}
+
 static void gm_pre_tick(void) {
-    if (!gm_pre_on || gm_pre_cursor >= gm_entry_count) return;
+    if (!gm_pre_on) return;
+    if (gm_pre_cursor >= gm_entry_count) { // icons done: the banners
+        if (gm_bnr_cursor < gm_entry_count && ++gm_pre_idle >= GM_PRE_IDLE_FRAMES)
+            gm_pre_banner_step();
+        return;
+    }
     if (++gm_pre_idle < GM_PRE_IDLE_FRAMES) return;
 
     while (gm_pre_cursor < gm_entry_count) {
@@ -1775,7 +1811,7 @@ static void gm_icons_update_window(bool animate) {
             if (e->asset.icon.state == GM_LOAD_STATE_LOADED) continue;
             if (e->asset.banner.state == GM_LOAD_STATE_LOADED) continue;
             gm_path_release(); // gm_load_banner opens its own file
-            gm_load_banner(e, 0, false, false);
+            gm_load_banner(e, 0, false, true);
         }
     }
 
@@ -2130,11 +2166,12 @@ void gm_line_load(int line_num) {
         if (entry->type == GM_FILE_TYPE_GAME || entry->type == GM_FILE_TYPE_APP) {
             gm_icon_load(&entry->asset.icon);
             if (gm_evict_on_scroll) {
-                // sliding window (>128): re-read from disc, no bnr_cache => no ARAM.
+                // sliding window (>127): from the ARAM banner cache when the banner is in it
+                // (the idle preload puts them there, gm_pre_tick), otherwise from the card.
                 // gm_load_banner guards against re-loading an already-resident banner.
                 // A game showing a save icon skips it (gm_banner_skippable).
                 if (!gm_banner_skippable(entry))
-                    gm_load_banner(entry, 0, false, false);
+                    gm_load_banner(entry, 0, false, true);
             } else {
                 gm_banner_load(&entry->asset.banner); // no-op: <=128 stays resident
             }
@@ -2236,7 +2273,7 @@ void gm_selected_banner_tick(int slot) {
     if (e->type != GM_FILE_TYPE_GAME) return;
     if (e->asset.banner.state == GM_LOAD_STATE_LOADED) return;
     gm_path_release(); // gm_load_banner opens its own file
-    gm_load_banner(e, 0, false, false);
+    gm_load_banner(e, 0, false, true);
 }
 
 bool gm_can_move() {
@@ -2450,7 +2487,7 @@ static void gm_bg_load_last_played(int target_slot) {
     if (last >= number_of_lines) last = number_of_lines - 1;
 
     // 1) Selected game's window first -> its banner is ready almost immediately.
-    for (int l = first; l <= last; l++) gm_bg_load_line(l, resident);
+    for (int l = first; l <= last; l++) gm_bg_load_line(l, true); // cached for the scroll too
     gm_scan_in_progress = false; // the menu may scroll now (resident fill below never
                                  // touches what a scroll touches)
 
