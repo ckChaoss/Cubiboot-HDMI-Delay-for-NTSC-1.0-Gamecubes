@@ -51,6 +51,9 @@ __attribute_data__ u32 remember_last_game = 0;
 __attribute_data__ u32 pin_swiss = 1;
 // On by default: games show the icon from their save in Swiss's emulated memory card (games.c).
 __attribute_data__ u32 save_icons = 1;
+// On by default: save icons are copied into ARAM during the scan, so scrolling never reads them
+// from the SD card (games.c, "Icon preload").
+__attribute_data__ u32 icon_preload = 1;
 // Set by the loader on a return from In-Game Reset (igr_skip_intro): no boot animation.
 __attribute_data__ u32 skip_intro = 0;
 __attribute_data__ u32 force_progressive = 0;
