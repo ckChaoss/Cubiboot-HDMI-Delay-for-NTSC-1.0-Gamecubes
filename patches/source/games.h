@@ -130,6 +130,7 @@ bool gm_swiss_pin_present(void);
 // Save icons: the frame of an icon to draw at `tick` (60 Hz), animated or still.
 const u8 *gm_icon_frame_data(gm_icon_buf_t *first, u32 tick);
 void gm_icons_mark_dirty(void);   // a scroll/jump/scan changed which rows are on screen
+void gm_selected_banner_tick(int slot); // menu thread, once per frame: info-box banner on demand
 void gm_icons_tick(void);         // menu thread, once per frame: load/free icons for those rows
 
 void gm_init_heap();
