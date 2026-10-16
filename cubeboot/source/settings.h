@@ -19,6 +19,7 @@ typedef struct settings {
     u32 remember_last_game;
     u32 pin_swiss;
     u32 save_icons;
+    u32 icon_preload;
     u32 igr_skip_intro;
     u32 igr_delay_ms;
     u32 progressive_enabled;
