@@ -1623,9 +1623,16 @@ static void gm_load_first_screen_anim(void) {
     gm_path_release(); // the scan opens other files next
 }
 
+// True while gm_check_files runs on the enum thread. The menu holds line scrolling until it
+// clears: a scroll loads banners (and takes pool slots) from the menu thread, which must not
+// overlap the scan's own file reads and pool use. Normally the boot animation covers the
+// scan; after an In-Game Reset the menu is up while it runs.
+static volatile bool gm_scan_in_progress = false;
+
 void gm_check_files(int path_count) {
     // Here we will also check for override assets and matching save icons
     u32 aram_offset = (1 * 1024 * 1024); // 1MB mark
+    gm_scan_in_progress = true;
 
     // Re-evaluate resident-vs-sliding per folder scan (pool is empty here after dealloc).
     gm_evict_on_scroll = false;
@@ -1837,6 +1844,9 @@ void gm_check_files(int path_count) {
     f32 runtime = (f32)diff_usec(start_time, gettime()) / 1000.0;
     OSReport("Header check took=%f\n", runtime);
     (void)runtime;
+    // The last-played folder's banner window is loaded right after this, on this thread
+    // (gm_bg_load_last_played), so that scan keeps scrolling held until the window is in.
+    if (!gm_scan_is_last_played) gm_scan_in_progress = false;
 }
 
 void gm_line_load(int line_num) {
@@ -1931,7 +1941,7 @@ void gm_line_changed(int delta) {
 
 // so grid can check if load/unload is possible
 bool gm_can_move() {
-    return true;
+    return !gm_scan_in_progress; // see gm_scan_in_progress
 }
 
 // ===== Last played =========================================================
@@ -2142,6 +2152,8 @@ static void gm_bg_load_last_played(int target_slot) {
 
     // 1) Selected game's window first -> its banner is ready almost immediately.
     for (int l = first; l <= last; l++) gm_bg_load_line(l, resident);
+    gm_scan_in_progress = false; // the menu may scroll now (resident fill below never
+                                 // touches what a scroll touches)
 
     // >pool: the rest stream in on scroll (sliding window); nothing more to preload.
     if (!resident) return;
@@ -2332,6 +2344,7 @@ void *gm_thread_worker(void* param) {
     if (gm_scan_is_last_played) {
         gm_bg_load_last_played(gm_pending_last_played_slot);
     }
+    gm_scan_in_progress = false; // every path out of the scan lets the menu scroll
 
     gm_scan_complete = !gm_scan_stopped;
     game_enum_running = false;
