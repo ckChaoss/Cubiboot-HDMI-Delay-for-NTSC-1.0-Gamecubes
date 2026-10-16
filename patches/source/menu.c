@@ -1034,6 +1034,7 @@ __attribute_data__ u32 stock_disc_mode = 0;
 __attribute_used__ void custom_gameselect_menu(u8 broken_alpha_0, u8 alpha_1, u8 broken_alpha_2) {
     icon_anim_tick++; // animated save icons
     gm_icons_tick();  // save icons for the rows on screen, after a scroll or a finished scan
+    gm_selected_banner_tick(selected_slot); // info-box banner for a game that skipped it
 
     // color
     u8 ui_alpha = alpha_1;
